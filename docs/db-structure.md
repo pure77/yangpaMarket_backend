@@ -22,11 +22,23 @@
 
 - `users`
   - 회원 계정의 기본 정보를 저장합니다.
-  - 계정 상태, 관리자 여부, 마케팅 수신 동의, 프로필 이미지 URL을 포함합니다.
+  - 계정 상태(`ACTIVE` / `INACTIVE` / `PENDING_PROFILE`), 관리자 여부, 마케팅 수신 동의, 프로필 이미지 URL을 포함합니다.
+  - 카카오 소셜 전용 계정은 `password_hash`와 `phone`이 NULL일 수 있습니다.
   - 한 사용자는 판매자, 입찰자, 구매자, 낙찰자, 관리자 역할을 모두 가질 수 있습니다.
+
+- `user_social_accounts`
+  - 카카오 소셜 계정 연동 정보를 저장합니다.
+  - `provider`(현재 KAKAO)와 `provider_user_id`로 소셜 계정을 식별합니다.
+  - 한 사용자는 provider당 1개의 소셜 계정을 가질 수 있습니다.
+
+- `auth_refresh_tokens`
+  - JWT 리프레시 토큰을 해시값으로 보관합니다.
+  - `revoked` 컬럼으로 폐기 여부를 추적합니다.
+  - `expires_at`으로 만료된 토큰을 정리할 수 있습니다.
 
 - `user_terms_agreements`
   - 회원별 약관 동의 정보를 저장합니다.
+  - `term_code`는 `VARCHAR(100)`으로 약관 코드 추가 시 DB 수정 없이 확장 가능합니다.
   - 각 사용자는 약관 코드별로 1개의 동의 레코드를 가집니다.
   - 회원가입 시 필수 약관 검증과 추후 감사 이력 확인에 사용됩니다.
 
@@ -101,19 +113,51 @@
 - 플랫폼 활동의 기준이 되는 회원 계정 테이블
 
 주요 컬럼:
-- `public_id`
-- `email`
-- `password_hash`
+- `public_id` — VARCHAR(64), 외부 노출용 식별자
+- `email` — 로그인 식별자, 유니크
+- `password_hash` — NULL 허용 (카카오 소셜 전용 계정은 NULL)
 - `nickname`
-- `phone`
+- `phone` — NULL 허용 (소셜 가입 시 미입력 가능), 유니크
 - `is_admin`
-- `status`
+- `status` — `ACTIVE` / `INACTIVE` / `PENDING_PROFILE`
 - `marketing_opt_in`
 
 중요 제약조건:
 - 이메일 유니크
 - 전화번호 유니크
 - 외부 공개 ID 유니크
+
+### `user_social_accounts`
+
+목적:
+- 카카오 OAuth 연동 계정 정보 저장
+
+주요 컬럼:
+- `user_id` — 연결된 회원 ID
+- `provider` — `KAKAO`
+- `provider_user_id` — 카카오에서 발급한 사용자 식별자
+- `email` — 소셜에서 받아온 이메일 (NULL 가능)
+- `linked_at` — 소셜 계정 연결 시각
+
+중요 제약조건:
+- `(provider, provider_user_id)` 유니크
+- `(user_id, provider)` 유니크 (사용자당 provider 1개)
+
+### `auth_refresh_tokens`
+
+목적:
+- JWT 리프레시 토큰 발급 이력 및 폐기 추적
+
+주요 컬럼:
+- `user_id` — 발급 대상 회원 ID
+- `token_hash` — 토큰 원문의 해시값 (원문 미저장)
+- `expires_at` — 만료 시각
+- `last_used_at` — 마지막 사용 시각
+- `revoked` — 폐기 여부 (BIT)
+- `revoked_at` — 폐기 시각
+
+중요 제약조건:
+- `token_hash` 유니크
 
 ### `user_terms_agreements`
 
@@ -122,7 +166,7 @@
 
 주요 컬럼:
 - `user_id`
-- `term_code`
+- `term_code` — VARCHAR(100), 약관 식별 코드 (확장 가능)
 - `is_required`
 - `agreed`
 - `agreed_at`
@@ -312,6 +356,8 @@
 
 ### 사용자 중심 관계
 
+- `users 1:N user_social_accounts`
+- `users 1:N auth_refresh_tokens`
 - `users 1:N user_terms_agreements`
 - `users 1:N images`
 - `users 1:N auctions` 판매자 기준
@@ -392,13 +438,16 @@
 처음 이 스키마를 보는 개발자라면 아래 순서로 읽는 것을 추천합니다.
 
 1. `users`
-2. `images`
-3. `auctions`
-4. `bids`
-5. `orders`
-6. `payments`
-7. `wishlist`
-8. `auction_status_histories`
-9. `payment_webhook_events`
+2. `user_social_accounts`
+3. `auth_refresh_tokens`
+4. `user_terms_agreements`
+5. `images`
+6. `auctions`
+7. `bids`
+8. `orders`
+9. `payments`
+10. `wishlist`
+11. `auction_status_histories`
+12. `payment_webhook_events`
 
-이 순서는 회원가입부터 이미지 업로드, 경매 참여, 결제, 감사 이력까지 실제 사용자 흐름과 맞닿아 있습니다.
+이 순서는 회원가입부터 소셜 로그인, 이미지 업로드, 경매 참여, 결제, 감사 이력까지 실제 사용자 흐름과 맞닿아 있습니다.
