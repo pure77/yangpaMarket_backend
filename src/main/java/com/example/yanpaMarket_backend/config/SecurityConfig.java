@@ -5,6 +5,7 @@ import com.example.yanpaMarket_backend.security.RestAuthenticationEntryPoint;
 import java.util.List;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.http.HttpMethod;
 import org.springframework.security.config.Customizer;
 import org.springframework.security.config.annotation.web.builders.HttpSecurity;
 import org.springframework.security.config.annotation.web.configurers.AbstractHttpConfigurer;
@@ -51,6 +52,12 @@ public class SecurityConfig {
                 .sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
                 .exceptionHandling(exception -> exception.authenticationEntryPoint(restAuthenticationEntryPoint))
                 .authorizeHttpRequests(auth -> auth
+                        // 내 경매는 인증 필요 — GET 공개 매처보다 반드시 먼저 평가
+                        .requestMatchers(HttpMethod.GET, "/api/v1/auctions/mine").authenticated()
+                        // 경매 목록/상세는 비로그인 공개
+                        .requestMatchers(HttpMethod.GET, "/api/v1/auctions", "/api/v1/auctions/*").permitAll()
+                        // 업로드 이미지 정적 서빙 공개
+                        .requestMatchers("/uploads/**").permitAll()
                         .requestMatchers(PUBLIC_ENDPOINTS).permitAll()
                         .anyRequest().authenticated()
                 )
