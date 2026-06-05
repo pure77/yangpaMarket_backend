@@ -5,7 +5,7 @@
 CREATE TABLE images (
   id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   public_id CHAR(26) NOT NULL,
-  uploader_user_id BIGINT UNSIGNED NOT NULL,
+  uploader_user_id BIGINT NOT NULL,
   storage_provider ENUM('S3', 'LOCAL') NOT NULL DEFAULT 'S3',
   object_key VARCHAR(500) NOT NULL,
   file_url VARCHAR(1000) NOT NULL,
@@ -30,8 +30,8 @@ CREATE TABLE images (
 CREATE TABLE auctions (
   id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   public_id CHAR(26) NOT NULL,
-  seller_user_id BIGINT UNSIGNED NOT NULL,
-  winner_user_id BIGINT UNSIGNED DEFAULT NULL,
+  seller_user_id BIGINT NOT NULL,
+  winner_user_id BIGINT DEFAULT NULL,
   highest_bid_id BIGINT UNSIGNED DEFAULT NULL,
   primary_image_id BIGINT UNSIGNED DEFAULT NULL,
   title VARCHAR(120) NOT NULL,
@@ -99,7 +99,7 @@ CREATE TABLE bids (
   id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   public_id CHAR(26) NOT NULL,
   auction_id BIGINT UNSIGNED NOT NULL,
-  bidder_user_id BIGINT UNSIGNED NOT NULL,
+  bidder_user_id BIGINT NOT NULL,
   amount BIGINT UNSIGNED NOT NULL,
   is_winning_bid TINYINT(1) NOT NULL DEFAULT 0,
   created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
