@@ -1,4 +1,4 @@
-package com.example.yanpaMarket_backend.auction.domain;
+package com.example.yanpaMarket_backend.auction.domain; // auction.domain = 경매 도메인 패키지
 
 import com.example.yanpaMarket_backend.common.domain.BaseTimeEntity;
 import jakarta.persistence.Column;
@@ -32,6 +32,12 @@ import lombok.NoArgsConstructor;
  *   → 입찰자 없을 때만 수정/삭제 허용
  * - cancel(reason): 삭제 = 소프트 취소 (status→CANCELLED, 사유/시각 기록)
  * - update(...): 시작가 변경 시 현재가를 시작가로 재설정
+ *
+ * [연결]
+ * - BaseTimeEntity 상속 → 생성/수정 시각 자동 기록.
+ * - AuctionRepository 로 조회/저장, AuctionService 가 비즈니스 규칙을 호출.
+ * - 응답 시 AuctionSummaryResponse/AuctionDetailResponse 로 변환됨.
+ * - isModifiable() 위반 시 서비스에서 ErrorCode.CANNOT_MODIFY 예외로 이어짐.
  */
 @Getter
 @Entity
@@ -204,6 +210,14 @@ public class Auction extends BaseTimeEntity {
         this.currentPrice = startPrice; // 시작가 변경 시 현재가 동기화
         this.buyNowPrice = buyNowPrice;
         this.endAt = endAt;
+    }
+
+    /**
+     * 공개(시작) 예정 시각 재설정.
+     * 수정 시점에 아직 공개 전인 경매의 공개 유예를 다시 부여할 때 사용한다.
+     */
+    public void reschedulePublishAt(LocalDateTime newStartAt) {
+        this.startAt = newStartAt;
     }
 
     /**

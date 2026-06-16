@@ -1,4 +1,4 @@
-package com.example.yanpaMarket_backend.auction.service;
+package com.example.yanpaMarket_backend.auction.service; // auction.service = 경매 비즈니스 로직 계층
 
 import com.example.yanpaMarket_backend.auction.domain.Auction;
 import com.example.yanpaMarket_backend.auction.domain.AuctionCategory;
@@ -46,6 +46,11 @@ import org.springframework.transaction.annotation.Transactional;
  *  listMine  → 판매자 본인의 모든 경매 반환
  *  update  → 소유자/수정가능 검증 → 필드 업데이트 → 이미지 재연결
  *  delete  → 소유자/수정가능 검증 → 소프트 취소(auction.cancel)
+ *
+ * [연결]
+ *  - 호출: AuctionController 의 각 엔드포인트.
+ *  - 협력: AuctionRepository, AuctionImageRepository, ImageRepository, UserRepository.
+ *  - 클래스 기본은 @Transactional(readOnly=true), 쓰기 메서드만 @Transactional 로 오버라이드.
  */
 @Service
 @RequiredArgsConstructor
@@ -98,7 +103,7 @@ public class AuctionService {
         Page<Auction> page = auctionRepository.findPublicList(
                 AuctionStatus.ACTIVE, LocalDateTime.now(), category, normalizedKeyword, pageable);
         Page<AuctionSummaryResponse> mapped = page.map(
-                auction -> AuctionSummaryResponse.from(auction, primaryImageUrl(auction)));
+                auction -> AuctionSummaryResponse.from(auction, primaryImageUrl(auction), null));
         return AuctionListResponse.from(mapped);
     }
 
@@ -110,7 +115,7 @@ public class AuctionService {
         Auction auction = getAuctionOrThrow(auctionPublicId);
         User seller = userRepository.findById(auction.getSellerUserId())
                 .orElseThrow(() -> new ApiException(ErrorCode.AUCTION_NOT_FOUND, "판매자를 찾을 수 없습니다."));
-        return AuctionDetailResponse.from(auction, imageUrls(auction.getId()), seller);
+        return AuctionDetailResponse.from(auction, imageUrls(auction.getId()), imagePublicIds(auction.getId()), seller);
     }
 
     /**
@@ -119,8 +124,9 @@ public class AuctionService {
      */
     public List<AuctionSummaryResponse> listMine(String sellerPublicId) {
         User seller = getUserOrUnauthorized(sellerPublicId);
+        String sellerPublicIdValue = seller.getPublicId();
         return auctionRepository.findBySellerUserIdOrderByCreatedAtDesc(seller.getId()).stream()
-                .map(auction -> AuctionSummaryResponse.from(auction, primaryImageUrl(auction)))
+                .map(auction -> AuctionSummaryResponse.from(auction, primaryImageUrl(auction), sellerPublicIdValue))
                 .toList();
     }
 
@@ -143,13 +149,24 @@ public class AuctionService {
                 request.title(), request.description(), request.category(),
                 request.condition(), request.startPrice(), request.buyNowPrice(), request.endTime());
 
-        // 이미지 재연결: 기존 매핑 제거 후 새 목록으로 재구성
+        // 아직 공개 전인 경매를 수정하면 공개 유예를 수정 시점 기준으로 다시 부여한다
+        LocalDateTime now = LocalDateTime.now();
+        if (auction.getStartAt().isAfter(now)) {
+            auction.reschedulePublishAt(now.plusMinutes(publishDelayMinutes));
+        }
+
+        // 이미지 재연결: 기존 매핑 제거 후 새 목록으로 재구성.
+        // flush()로 DELETE를 INSERT보다 먼저 DB에 반영해야 한다.
+        // Hibernate는 flush 시 INSERT를 DELETE보다 먼저 실행하므로, flush 없이 재INSERT하면
+        // auction_images의 유니크 제약(auction_id+image_id, auction_id+sort_order)과 충돌해 수정이 실패한다.
         auctionImageRepository.deleteByAuctionId(auction.getId());
+        auctionImageRepository.flush();
         auction.assignPrimaryImage(null);
         attachImages(auction, request.imageIds());
 
         User refreshedSeller = userRepository.findById(auction.getSellerUserId()).orElseThrow();
-        return AuctionDetailResponse.from(auction, imageUrls(auction.getId()), refreshedSeller);
+        return AuctionDetailResponse.from(
+                auction, imageUrls(auction.getId()), imagePublicIds(auction.getId()), refreshedSeller);
     }
 
     /**
@@ -220,6 +237,20 @@ public class AuctionService {
                     .ifPresent(image -> urls.add(image.getFileUrl()));
         }
         return urls;
+    }
+
+    /**
+     * 특정 경매의 이미지 publicId 목록을 sortOrder 순으로 반환한다.
+     * imageUrls 와 동일 순서 보장 — 프론트에서 수정 시 기존 이미지를 식별하는 데 사용한다.
+     */
+    private List<String> imagePublicIds(Long auctionId) {
+        List<AuctionImage> mappings = auctionImageRepository.findByAuctionIdOrderBySortOrderAsc(auctionId);
+        List<String> publicIds = new ArrayList<>();
+        for (AuctionImage mapping : mappings) {
+            imageRepository.findById(mapping.getImageId())
+                    .ifPresent(image -> publicIds.add(image.getPublicId()));
+        }
+        return publicIds;
     }
 
     /**

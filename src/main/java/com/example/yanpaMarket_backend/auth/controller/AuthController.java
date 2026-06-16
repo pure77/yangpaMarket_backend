@@ -1,4 +1,4 @@
-package com.example.yanpaMarket_backend.auth.controller;
+package com.example.yanpaMarket_backend.auth.controller; // auth.controller = 인증 HTTP 요청 처리 계층
 
 import com.example.yanpaMarket_backend.auth.dto.KakaoCallbackRequest;
 import com.example.yanpaMarket_backend.auth.dto.KakaoCallbackResponse;
@@ -17,12 +17,21 @@ import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
+/**
+ * [무엇] 인증 관련 REST 엔드포인트 모음 컨트롤러.
+ *        카카오 로그인 시작/콜백, 회원가입 완료, 토큰 재발급, 로그아웃을 제공한다.
+ * [어떻게 쓰임]
+ *   - HTTP 요청을 받아 검증(@Valid)하고 AuthService 에 위임, 결과를 ApiResponse로 감싸 반환.
+ * [연결]
+ *   - @RequestMapping("/api/v1/auth"): 모든 경로의 공통 prefix.
+ *   - login/callback/signup/refresh 는 SecurityConfig 의 공개 경로, logout 은 인증 필요.
+ */
 @RestController
 @RequestMapping("/api/v1/auth")
 @RequiredArgsConstructor
 public class AuthController {
 
-    private final AuthService authService;
+    private final AuthService authService; // 인증 비즈니스 로직 위임 대상(생성자 주입)
 
     /**
      * [카카오 로그인 시작]

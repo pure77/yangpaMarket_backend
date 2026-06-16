@@ -1,4 +1,4 @@
-package com.example.yanpaMarket_backend.auth.service;
+package com.example.yanpaMarket_backend.auth.service; // 테스트 대상(AuthService)과 같은 패키지
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -40,9 +40,20 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.test.util.ReflectionTestUtils;
 
-@ExtendWith(MockitoExtension.class)
+/**
+ * [무엇] AuthService 의 로그인/회원가입 흐름을 검증하는 "단위 테스트".
+ * [방식] 협력 객체(카카오 클라이언트, DB Repository, JwtProvider 등)를 모두 가짜(@Mock)로 대체해
+ *        DB/네트워크 없이 AuthService 의 분기 로직만 빠르게 검증한다(Mockito).
+ * [핵심 검증 포인트]
+ *   - 신규 사용자는 회원가입 완료 전까지 DB에 저장되지 않는다.
+ *   - 회원가입 완료 시 User/소셜연결/약관/리프레시토큰이 모두 저장된다.
+ *   - 전화번호 중복 시 CONFLICT 예외, 그리고 아무것도 저장하지 않는다.
+ *   - 이미 연결된 사용자는 즉시 토큰을 발급한다.
+ */
+@ExtendWith(MockitoExtension.class) // Mockito가 @Mock/@InjectMocks를 처리하도록 확장
 class AuthServiceTest {
 
+    // === 협력 객체들을 가짜(Mock)로 준비 ===
     @Mock
     private KakaoOAuthClient kakaoOAuthClient;
     @Mock
@@ -59,8 +70,9 @@ class AuthServiceTest {
     private RefreshTokenStore refreshTokenStore;
 
     @InjectMocks
-    private AuthService authService;
+    private AuthService authService; // 위 가짜들이 주입된, 실제 테스트 대상
 
+    /** [콜백-신규] 신규 사용자는 signupToken만 받고, 회원가입 완료 전엔 DB 저장이 일어나지 않아야 한다. */
     @Test
     void handleKakaoCallback_NewUser_DoesNotPersistBeforeSignupComplete() {
         KakaoCallbackRequest request = new KakaoCallbackRequest("code", "state", "http://localhost/callback");
@@ -81,10 +93,12 @@ class AuthServiceTest {
         assertThat(response.email()).isEqualTo("new@yangpa.com");
         assertThat(response.nickname()).isEqualTo("newbie");
 
+        // 검증: 회원가입 완료 전이므로 어떤 저장도 호출되지 않아야 함
         verify(userRepository, never()).save(any(User.class));
         verify(userSocialAccountRepository, never()).save(any(UserSocialAccount.class));
     }
 
+    /** [가입완료-신규] 회원가입 완료 시 User/소셜연결/약관/리프레시토큰이 모두 저장되고 토큰이 발급된다. */
     @Test
     void completeSignup_NewUser_PersistsUserSocialAndTerms() {
         SignupCompleteRequest request = new SignupCompleteRequest(
@@ -138,6 +152,7 @@ class AuthServiceTest {
         verify(refreshTokenStore).replace(any(User.class), eq("refresh-token"), any(Instant.class));
     }
 
+    /** [가입완료-전화중복] 전화번호가 이미 존재하면 CONFLICT 예외를 던지고 아무것도 저장하지 않는다. */
     @Test
     void completeSignup_WhenPhoneAlreadyExists_ThrowsConflictAndDoesNotPersist() {
         SignupCompleteRequest request = new SignupCompleteRequest(
@@ -170,6 +185,7 @@ class AuthServiceTest {
         verify(userTermsAgreementRepository, never()).saveAll(any(List.class));
     }
 
+    /** [콜백-기존] 이미 카카오에 연결된 완성 사용자는 회원가입 없이 즉시 토큰을 발급받는다. */
     @Test
     void handleKakaoCallback_AlreadyLinkedUser_IssuesTokensImmediately() {
         KakaoCallbackRequest request = new KakaoCallbackRequest("code", "state", "http://localhost/callback");
@@ -213,6 +229,7 @@ class AuthServiceTest {
         verify(jwtProvider, never()).createKakaoSignupToken(any(KakaoSignupTokenPayload.class));
     }
 
+    /** [헬퍼] 필수 약관 2개(동의) + 선택 약관 1개(미동의)로 구성된 기본 약관 동의 목록. */
     private List<TermsAgreementRequest> defaultAgreements() {
         return List.of(
                 new TermsAgreementRequest("TERMS_OF_SERVICE", true, true),
