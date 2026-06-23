@@ -60,6 +60,10 @@ public class SecurityConfig {
                 .authorizeHttpRequests(auth -> auth              // 경로별 접근 권한 규칙 (위에서부터 순서대로 평가)
                         // "내 경매"는 인증 필요 — 아래 GET 공개 매처보다 반드시 먼저 둬야 가려지지 않음
                         .requestMatchers(HttpMethod.GET, "/api/v1/auctions/mine").authenticated()
+                        // WebSocket 핸드셰이크/구독은 공개 (입찰은 REST POST에서 인증)
+                        .requestMatchers("/ws/**").permitAll()
+                        // 입찰 내역 조회는 비로그인 공개 ("/auctions/*" 매처는 한 세그먼트만 매칭하므로 별도 명시)
+                        .requestMatchers(HttpMethod.GET, "/api/v1/auctions/*/bids").permitAll()
                         // 경매 목록/상세 조회는 비로그인 공개
                         .requestMatchers(HttpMethod.GET, "/api/v1/auctions", "/api/v1/auctions/*").permitAll()
                         // 업로드된 이미지 정적 파일 공개
