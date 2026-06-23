@@ -9,7 +9,7 @@ version = '0.0.1-SNAPSHOT'
 
 java {
 	toolchain {
-		languageVersion = JavaLanguageVersion.of(17)
+		languageVersion = JavaLanguageVersion.of(18)
 	}
 }
 
@@ -26,6 +26,8 @@ dependencies {
 	implementation 'org.flywaydb:flyway-core'
 	implementation 'com.github.f4b6a3:ulid-creator:5.2.3'
 	implementation 'io.jsonwebtoken:jjwt-api:0.12.6'
+	implementation platform('software.amazon.awssdk:bom:2.28.16')
+	implementation 'software.amazon.awssdk:s3'
 	compileOnly 'org.projectlombok:lombok'
 	runtimeOnly 'com.mysql:mysql-connector-j'
 	runtimeOnly 'io.jsonwebtoken:jjwt-impl:0.12.6'
