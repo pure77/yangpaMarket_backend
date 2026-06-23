@@ -1,6 +1,8 @@
 package com.example.yanpaMarket_backend.auction.domain; // auction.domain = 경매 도메인 패키지
 
 import com.example.yanpaMarket_backend.common.domain.BaseTimeEntity;
+import com.example.yanpaMarket_backend.global.error.ApiException;
+import com.example.yanpaMarket_backend.global.error.ErrorCode;
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
 import jakarta.persistence.EnumType;
@@ -123,6 +125,22 @@ public class Auction extends BaseTimeEntity {
     @Column(name = "cancel_reason", length = 255)
     private String cancelReason;
 
+    /** 최소 입찰 인상폭 (DB 기본 10000). 입찰가는 현재가 + 이 값 이상이어야 한다. */
+    @Column(name = "minimum_bid_increment", nullable = false)
+    private Long minimumBidIncrement;
+
+    /** 낙찰자 User PK (종료 시 입찰자 있으면 기록). */
+    @Column(name = "winner_user_id")
+    private Long winnerUserId;
+
+    /** 현재 최고 입찰 Bid PK (입찰마다 갱신). */
+    @Column(name = "highest_bid_id")
+    private Long highestBidId;
+
+    /** 경매 종료 처리 시각. */
+    @Column(name = "ended_at")
+    private LocalDateTime endedAt;
+
     /**
      * 낙관적 잠금 버전.
      * 동시 입찰 시 충돌 감지 — 같은 버전을 동시에 수정하면 OptimisticLockException 발생.
@@ -162,6 +180,7 @@ public class Auction extends BaseTimeEntity {
         this.currentPrice = startPrice; // 등록 시 현재가 = 시작가
         this.buyNowPrice = buyNowPrice;
         this.bidCount = 0;
+        this.minimumBidIncrement = 10000L; // DB DEFAULT와 동일. 엔티티 매핑 추가로 INSERT에 포함되므로 명시 초기화 필수
         this.status = AuctionStatus.ACTIVE;
         this.startAt = startAt;
         this.endAt = endAt;
@@ -241,5 +260,46 @@ public class Auction extends BaseTimeEntity {
         this.status = AuctionStatus.CANCELLED;
         this.cancelReason = reason;
         this.cancelledAt = LocalDateTime.now();
+    }
+
+    /**
+     * 입찰 반영(검증 포함). 임계구역(경매별 락) 안에서 호출할 것.
+     * 규칙 위반 시 ApiException을 던진다. 통과 시 현재가/입찰수만 갱신한다.
+     * (highest_bid_id는 Bid 저장 후 assignHighestBid로 별도 반영)
+     */
+    public void placeBid(Long bidderUserId, long amount, LocalDateTime now) {
+        if (!isLive(now) || !endAt.isAfter(now)) {
+            throw new ApiException(ErrorCode.AUCTION_ENDED);
+        }
+        if (sellerUserId.equals(bidderUserId)) {
+            throw new ApiException(ErrorCode.SELF_BID_NOT_ALLOWED);
+        }
+        if (amount < currentPrice + minimumBidIncrement) {
+            throw new ApiException(ErrorCode.BID_TOO_LOW);
+        }
+        this.currentPrice = amount;
+        this.bidCount += 1;
+    }
+
+    /** 저장된 최고 입찰의 PK를 현재 최고가 입찰로 지정한다. */
+    public void assignHighestBid(Long bidId) {
+        this.highestBidId = bidId;
+    }
+
+    /**
+     * 경매 종료 처리.
+     * - 입찰자 있음(highestBid != null): status=PAYMENT_PENDING, winner/highestBid 기록.
+     * - 입찰자 없음: status=ENDED.
+     * 두 경우 모두 endedAt을 기록한다.
+     */
+    public void close(Bid highestBid, LocalDateTime now) {
+        this.endedAt = now;
+        if (highestBid != null) {
+            this.status = AuctionStatus.PAYMENT_PENDING;
+            this.winnerUserId = highestBid.getBidderUserId();
+            this.highestBidId = highestBid.getId();
+        } else {
+            this.status = AuctionStatus.ENDED;
+        }
     }
 }
