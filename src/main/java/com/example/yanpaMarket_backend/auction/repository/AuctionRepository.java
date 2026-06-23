@@ -44,4 +44,7 @@ public interface AuctionRepository extends JpaRepository<Auction, Long> {
 
     /** [내 경매] 본인이 등록한 모든 경매(공개유예/취소 포함)를 최신순으로 조회 */
     List<Auction> findBySellerUserIdOrderByCreatedAtDesc(Long sellerUserId);
+
+    /** 주어진 상태이면서 종료시각이 지난 경매(자동 종료 대상) 조회. */
+    List<Auction> findByStatusAndEndAtBefore(AuctionStatus status, LocalDateTime time);
 }
