@@ -35,7 +35,7 @@ import org.springframework.transaction.annotation.Transactional;
  * 경매 CRUD 서비스.
  *
  * 핵심 정책:
- *  - 등록 시 start_at = now + 공개유예(기본 5분). 그 전엔 공개 목록 비노출/입찰 불가.
+ *  - 등록 시 start_at = now + 공개유예(기본 10초, 테스트용). 그 전엔 공개 목록 비노출/입찰 불가.
  *  - 수정/삭제는 소유자 && 입찰 0건일 때만(isModifiable). 아니면 FORBIDDEN/CANNOT_MODIFY.
  *  - 삭제는 소프트 취소(cancel).
  *
@@ -62,13 +62,13 @@ public class AuctionService {
     private final ImageRepository imageRepository;
     private final UserRepository userRepository;
 
-    // application.properties: app.auction.publish-delay-minutes=5 (기본값 5분)
-    @Value("${app.auction.publish-delay-minutes:5}")
-    private long publishDelayMinutes;
+    // application.properties: app.auction.publish-delay-seconds=10 (기본값 10초, 테스트용)
+    @Value("${app.auction.publish-delay-seconds:10}")
+    private long publishDelaySeconds;
 
     /**
      * 경매 등록.
-     * start_at 을 now + publishDelayMinutes 로 설정해 즉시 공개를 방지한다.
+     * start_at 을 now + publishDelaySeconds 로 설정해 즉시 공개를 방지한다.
      */
     @Transactional
     public AuctionCreateResponse create(String sellerPublicId, AuctionCreateRequest request) {
@@ -84,7 +84,7 @@ public class AuctionService {
                 .itemCondition(request.condition())
                 .startPrice(request.startPrice())
                 .buyNowPrice(request.buyNowPrice())
-                .startAt(now.plusMinutes(publishDelayMinutes)) // 5분 공개 유예
+                .startAt(now.plusSeconds(publishDelaySeconds)) // 공개 유예 (테스트용 10초)
                 .endAt(request.endTime())
                 .build();
         auctionRepository.save(auction);
@@ -158,7 +158,7 @@ public class AuctionService {
         // 아직 공개 전인 경매를 수정하면 공개 유예를 수정 시점 기준으로 다시 부여한다
         LocalDateTime now = LocalDateTime.now();
         if (auction.getStartAt().isAfter(now)) {
-            auction.reschedulePublishAt(now.plusMinutes(publishDelayMinutes));
+            auction.reschedulePublishAt(now.plusSeconds(publishDelaySeconds));
         }
 
         // 이미지 재연결: 기존 매핑 제거 후 새 목록으로 재구성.
