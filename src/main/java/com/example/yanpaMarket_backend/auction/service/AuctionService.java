@@ -115,7 +115,13 @@ public class AuctionService {
         Auction auction = getAuctionOrThrow(auctionPublicId);
         User seller = userRepository.findById(auction.getSellerUserId())
                 .orElseThrow(() -> new ApiException(ErrorCode.AUCTION_NOT_FOUND, "판매자를 찾을 수 없습니다."));
-        return AuctionDetailResponse.from(auction, imageUrls(auction.getId()), imagePublicIds(auction.getId()), seller);
+        // 낙찰자 publicId (종료되어 winnerUserId가 기록된 경우에만 존재, 없으면 null)
+        String winnerPublicId = (auction.getWinnerUserId() == null)
+                ? null
+                : userRepository.findById(auction.getWinnerUserId())
+                        .map(User::getPublicId).orElse(null);
+        return AuctionDetailResponse.from(
+                auction, imageUrls(auction.getId()), imagePublicIds(auction.getId()), seller, winnerPublicId);
     }
 
     /**
@@ -165,8 +171,9 @@ public class AuctionService {
         attachImages(auction, request.imageIds());
 
         User refreshedSeller = userRepository.findById(auction.getSellerUserId()).orElseThrow();
+        // 수정은 입찰 0건(미낙찰) 경매에서만 가능하므로 낙찰자는 항상 null
         return AuctionDetailResponse.from(
-                auction, imageUrls(auction.getId()), imagePublicIds(auction.getId()), refreshedSeller);
+                auction, imageUrls(auction.getId()), imagePublicIds(auction.getId()), refreshedSeller, null);
     }
 
     /**

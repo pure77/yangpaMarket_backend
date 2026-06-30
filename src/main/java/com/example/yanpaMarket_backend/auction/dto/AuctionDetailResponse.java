@@ -24,6 +24,7 @@ public record AuctionDetailResponse(
         Integer bidCount,          // 입찰 건수
         LocalDateTime endTime,     // 마감 시각
         LocalDateTime startTime,   // 공개 시각
+        String winnerUserId,       // 낙찰자 public_id (미낙찰/진행중이면 null)
         String status,             // 상태 문자열
         String category,           // 카테고리 문자열
         String condition,          // 상품 상태 문자열
@@ -48,7 +49,7 @@ public record AuctionDetailResponse(
      * @param seller    판매자 User 엔티티
      */
     public static AuctionDetailResponse from(
-            Auction auction, List<String> imageUrls, List<String> imageIds, User seller) {
+            Auction auction, List<String> imageUrls, List<String> imageIds, User seller, String winnerUserId) {
         return new AuctionDetailResponse(
                 auction.getPublicId(),
                 auction.getTitle(),
@@ -61,6 +62,7 @@ public record AuctionDetailResponse(
                 auction.getBidCount(),
                 auction.getEndAt(),
                 auction.getStartAt(),
+                winnerUserId,
                 auction.getStatus().name(),
                 auction.getCategory().name(),
                 auction.getItemCondition().name(),
