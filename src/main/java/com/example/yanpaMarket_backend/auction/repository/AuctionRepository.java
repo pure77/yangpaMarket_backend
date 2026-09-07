@@ -22,6 +22,21 @@ public interface AuctionRepository extends JpaRepository<Auction, Long> {
     Optional<Auction> findByPublicId(String publicId); // 외부 식별자로 경매 1건 조회(상세)
 
     /**
+     * [ID 프로젝션] publicId로 내부 PK만 조회한다. 엔티티를 영속성 컨텍스트에 올리지 않는다.
+     *
+     * [왜 필요한가] BidService.placeBid는 락 밖에서 경매를 식별한 뒤,
+     *   락 안에서 findById로 "최신 상태를 재조회"해 검증한다(TOCTOU 방지).
+     *   그런데 락 밖에서 findByPublicId로 엔티티를 읽으면 그 낡은 인스턴스가 영속성 컨텍스트에 남는다.
+     *   OSIV(spring.jpa.open-in-view)가 켜지면 요청 전체가 컨텍스트 하나를 공유하므로
+     *   락 안의 findById가 DB에 가지 않고 1차 캐시의 낡은 인스턴스를 그대로 돌려준다 → 재조회가 무의미.
+     *   ID만 가져오면 낡은 엔티티가 애초에 컨텍스트에 안 들어가므로 OSIV 설정과 무관하게 안전하다.
+     *
+     * 존재 확인(404 판정)은 Optional.empty()로 그대로 되고, 읽는 컬럼도 하나뿐이다.
+     */
+    @Query("select a.id from Auction a where a.publicId = :publicId")
+    Optional<Long> findIdByPublicId(@Param("publicId") String publicId);
+
+    /**
      * [공개 목록 조회] 진행중(status) + 공개시각 지남(start_at<=now) 경매를,
      * 카테고리/키워드(검색어)로 추가 필터링한다.
      * - 파라미터가 null이면 해당 조건은 건너뛴다(동적 필터).
@@ -47,4 +62,16 @@ public interface AuctionRepository extends JpaRepository<Auction, Long> {
 
     /** 주어진 상태이면서 종료시각이 지난 경매(자동 종료 대상) 조회. */
     List<Auction> findByStatusAndEndAtBefore(AuctionStatus status, LocalDateTime time);
+
+    /**
+     * [자동 종료 대상 ID만 조회] 종료 배치가 "건별 트랜잭션"으로 처리하기 위해 ID 목록만 먼저 받는다.
+     *
+     * 엔티티를 통째로 읽지 않는 이유: 이 조회는 트랜잭션 밖에서 실행되므로 반환된 엔티티는 준영속이라
+     * 어차피 쓸 수 없고, 실제 종료는 AuctionCloser가 각자 트랜잭션 안에서 findById로 다시 읽는다.
+     * (ID 프로젝션을 쓰는 이유는 findIdByPublicId와 동일 — 낡은 엔티티를 영속성 컨텍스트에 올리지 않는다)
+     */
+    @Query("select a.id from Auction a where a.status = :status and a.endAt < :time")
+    List<Long> findIdsByStatusAndEndAtBefore(
+            @Param("status") AuctionStatus status,
+            @Param("time") LocalDateTime time);
 }
