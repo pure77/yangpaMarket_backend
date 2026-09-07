@@ -405,14 +405,14 @@ class HotAuctionLoadTest {
             String report = buildReport(reloaded, persistedBids, wallNanos, hikari,
                     phaseBidders, reloaded.getBidCount() - bidCountBefore);
             System.out.println(report);
-            writeReport(report);
+            writeReport(report, "bidders" + phaseBidders);
             results.add(snapshot(phaseBidders, wallNanos));
         }
 
         if (results.size() > 1) {
             String table = sweepTable(results);
             System.out.println(table);
-            writeReport(table);
+            writeReport(table, "sweep");
         }
 
         // ── 정리 ────────────────────────────────────────────────────────────────
@@ -866,12 +866,27 @@ class HotAuctionLoadTest {
         return sb.toString();
     }
 
-    private void writeReport(String report) {
+    /**
+     * 리포트를 파일로 남긴다. label은 파일명에 붙어 어느 리포트인지 구분한다.
+     *
+     * [왜 label이 필요한가 — 실제로 데이터를 잃었다]
+     *   예전엔 파일명이 "hot-auction-{초단위시각}.txt" 뿐이었다. 스윕의 마지막 구간 리포트와
+     *   그 뒤에 이어 쓰는 비교표가 같은 초에 저장되면 파일명이 충돌해 표가 구간 리포트를
+     *   덮어썼다. 조용히 사라지므로 알아채기도 어렵다(실제로 100명 구간 상세를 한 번 잃었다).
+     *
+     * [그래도 겹치면] 같은 label이 같은 초에 두 번 나오는 경우(-Dload.sweep=20,20 같은)를 대비해
+     *   -2, -3 을 붙여가며 빈 이름을 찾는다. 덮어쓰느니 파일이 하나 더 생기는 편이 낫다.
+     */
+    private void writeReport(String report, String label) {
         try {
             Path dir = Path.of("build", "reports", "load");
             Files.createDirectories(dir);
             String stamp = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss"));
-            Path file = dir.resolve("hot-auction-" + stamp + ".txt");
+            String base = "hot-auction-" + stamp + "-" + label;
+            Path file = dir.resolve(base + ".txt");
+            for (int n = 2; Files.exists(file) && n < 100; n++) {
+                file = dir.resolve(base + "-" + n + ".txt");
+            }
             Files.writeString(file, report);
             System.out.println("리포트 저장: " + file.toAbsolutePath());
         } catch (Exception e) {
