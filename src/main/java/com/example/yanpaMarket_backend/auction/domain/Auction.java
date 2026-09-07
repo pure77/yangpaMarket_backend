@@ -266,17 +266,60 @@ public class Auction extends BaseTimeEntity {
      * 입찰 반영(검증 포함). 임계구역(경매별 락) 안에서 호출할 것.
      * 규칙 위반 시 ApiException을 던진다. 통과 시 현재가/입찰수만 갱신한다.
      * (highest_bid_id는 Bid 저장 후 assignHighestBid로 별도 반영)
+     *
+     * [왜 서비스가 아니라 엔티티에 있나]
+     *   검증에 필요한 값(status/startAt/endAt/sellerUserId/currentPrice/minimumBidIncrement)이
+     *   전부 이 클래스의 필드다. 서비스로 빼면 게터를 6개 열어야 하고(캡슐화 붕괴),
+     *   누군가 검증을 건너뛰고 값을 바꿀 수 있다.
+     *   지금은 currentPrice를 바꾸는 유일한 통로가 이 메서드라 규칙을 우회할 방법이 없다.
+     *
+     * [왜 now를 파라미터로 받나 — 시간 주입]
+     *   메서드 안에서 LocalDateTime.now()를 부르지 않는다.
+     *   (1) 테스트: 마감 1초 전/후를 자유롭게 시뮬레이션 가능(DB·스프링 불필요)
+     *   (2) 일관성: BidService.doPlaceBid가 계산한 now 하나를 검증·Bid 생성·remaining 계산이 공유
+     *
+     * [검증 순서] 비용이 아니라 "의미의 강도" 순이다.
+     *   종료 여부(경매 자체가 성립 안 함) → 본인 여부(자격 없음) → 금액(자격은 있는데 부족)
+     *   종료된 경매에 "10,000원 더 올리세요"라고 안내하면 이상하다.
+     *
+     * [반환값이 void인 이유] 성공하면 조용히 상태만 바꾸고 실패는 예외로 알린다.
+     *   boolean이면 호출자가 무시할 수 있고, 어떤 규칙을 어겼는지도 전달할 수 없다.
      */
     public void placeBid(Long bidderUserId, long amount, LocalDateTime now) {
+        // [규칙 ①] 진행중 여부 — 조건이 둘로 나뉜 데는 이유가 있다.
+        //   isLive(now)        : status==ACTIVE && startAt <= now  → "공개 유예"가 지났는가
+        //   endAt.isAfter(now) : 아직 마감 전인가
+        //
+        //   등록 ──공개 유예── startAt ──── 입찰 가능 ──── endAt ──── 종료
+        //        입찰 X                  입찰 O                  입찰 X
+        //
+        //   [핵심] isLive는 종료 시각을 보지 않는다. 스케줄러가 10초 주기라 마감이 지나도
+        //   최대 10초 동안 status는 여전히 ACTIVE다. 그 틈에 들어온 입찰을 막는 게 endAt 조건이다.
+        //   → 스케줄러의 지연을 도메인이 방어한다. 이 한 줄 덕에 주기를 느슨하게 둬도 데이터가 정확하다.
+        //
+        //   [경계값] 부등호가 서로 다른 건 의도적이다. 입찰 가능 구간은 [startAt, endAt).
+        //     startAt <= now  → 시작 정각부터 허용
+        //     now < endAt     → 마감 정각은 거절
         if (!isLive(now) || !endAt.isAfter(now)) {
             throw new ApiException(ErrorCode.AUCTION_ENDED);
         }
+        // [규칙 ②] 본인 입찰 금지 — 자기 물건 값을 인위적으로 올리는 자전거래(shill bidding) 방지.
+        //   [== 대신 equals인 이유] Long은 객체라 ==는 참조 비교다. 자바는 -128~127만 캐싱하므로
+        //   테스트 데이터(작은 ID)에서는 우연히 통과하고 실서비스 ID에서만 조용히 뚫린다.
+        //   null이 아닌 sellerUserId(nullable=false)를 앞에 둔 것도 방어적 습관.
+        //   [한계] 부계정을 만들면 우회된다. 근본 방어가 아니라 최소 방어선이다.
         if (sellerUserId.equals(bidderUserId)) {
             throw new ApiException(ErrorCode.SELF_BID_NOT_ALLOWED);
         }
+        // [규칙 ③] 최소 입찰 단위 — "현재가보다 크면 통과"가 아니라 "현재가 + 인상폭 이상"이어야 한다.
+        //   1원씩 올리는 눈치싸움(nibbling)을 막는다. 그대로 두면 입찰이 수천 건 쌓이고
+        //   WebSocket broadcast도 그만큼 나가 성능과 UX가 동시에 나빠진다.
+        //   [왜 상수가 아니라 필드인가] 경매별로 다르게 설정할 여지를 남긴 것.
+        //   "시작가의 5%" 같은 정책이 생겨도 스키마 변경 없이 코드만 바꾸면 된다.
         if (amount < currentPrice + minimumBidIncrement) {
             throw new ApiException(ErrorCode.BID_TOO_LOW);
         }
+        // 통과 시 딱 두 값만 갱신한다. highestBidId는 Bid가 아직 저장 전이라 PK가 없어 건드릴 수 없다.
         this.currentPrice = amount;
         this.bidCount += 1;
     }
