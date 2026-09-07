@@ -1,5 +1,6 @@
 package com.example.yanpaMarket_backend.config; // config = 앱 전역 설정 모음
 
+import com.example.yanpaMarket_backend.config.properties.CorsProperties;   // CORS 허용 출처 설정(app.cors.*)
 import com.example.yanpaMarket_backend.security.JwtAuthenticationFilter;   // 요청마다 JWT를 검사하는 커스텀 필터
 import com.example.yanpaMarket_backend.security.RestAuthenticationEntryPoint; // 인증 실패 시 401 JSON 응답 처리기
 import java.util.List;
@@ -34,7 +35,8 @@ public class SecurityConfig {
             "/api/v1/auth/kakao/login",      // 카카오 로그인 URL 발급
             "/api/v1/auth/kakao/callback",   // 카카오 콜백(인가코드 처리)
             "/api/v1/auth/signup/complete",  // 회원가입 2단계 완료
-            "/api/v1/auth/refresh"           // 토큰 갱신
+            "/api/v1/auth/refresh",          // 토큰 갱신
+            "/api/v1/auth/dev/login"         // [dev 전용] 테스트 로그인 (DevAuthController가 dev 프로필에서만 존재)
     };
 
     /**
@@ -78,13 +80,20 @@ public class SecurityConfig {
     }
 
     /**
-     * [CORS] 로컬 프론트 개발 서버(5173)에서 오는 요청을 허용하는 정책.
-     * 브라우저의 교차 출처(origin) 차단을 풀어주는 설정.
+     * [CORS] 프론트에서 오는 교차 출처 요청을 허용하는 정책.
+     *
+     * [허용 출처는 설정에서 주입] app.cors.allowed-origins (CorsProperties)
+     *   WebSocketConfig의 핸드셰이크 Origin 검사와 "같은 값"을 공유한다.
+     *   예전에는 양쪽이 각자 localhost:5173을 하드코딩해, 배포 시 한쪽만 고치면
+     *   나머지가 조용히 막혔다. 운영 값은 CORS_ALLOWED_ORIGINS 환경변수로 주입한다.
      */
     @Bean
-    public CorsConfigurationSource corsConfigurationSource() {
+    public CorsConfigurationSource corsConfigurationSource(CorsProperties corsProperties) {
         CorsConfiguration configuration = new CorsConfiguration();
-        configuration.setAllowedOrigins(List.of("http://localhost:5173")); // 허용할 프론트 주소
+        // [Origins가 아니라 OriginPatterns인 이유] allowCredentials(true)와 함께 쓸 때
+        //   setAllowedOrigins는 와일드카드를 허용하지 않아 "https://*.yangpa.com" 같은 값에서
+        //   런타임 예외가 난다. WebSocketConfig도 Patterns를 쓰므로 양쪽을 맞춘다.
+        configuration.setAllowedOriginPatterns(corsProperties.getAllowedOrigins()); // 허용할 프론트 주소
         configuration.setAllowedMethods(List.of("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS")); // 허용 메서드
         configuration.setAllowedHeaders(List.of("*"));   // 모든 요청 헤더 허용(Authorization 포함)
         configuration.setAllowCredentials(true);          // 쿠키/인증정보 동반 요청 허용
