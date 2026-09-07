@@ -178,6 +178,21 @@ class HotAuctionLoadTest {
     private final int durationSeconds = Integer.getInteger("load.seconds", 60);
     private final int thinkMillis = Integer.getInteger("load.thinkMillis", 100);
 
+    /**
+     * [무엇] 거절(400) 응답의 minimumBid를 다음 입찰에 반영할지. `-Dload.rejectionHint=true`로 켠다.
+     *
+     * [왜 기본이 꺼짐인가]
+     *   기준선 수치가 이 기능이 없던 시절에 측정됐다. 기본을 켜두면 아무 옵션 없이 돌린 결과가
+     *   기준선과 비교 불가능해진다. 꺼짐이 기본이어야 "옵션 없는 실행 = 기준선과 같은 조건"이 유지된다.
+     *
+     * [왜 스위치가 필요한가]
+     *   이 파싱은 거절률이 높은 구간에서 요청의 대부분에 대해 돈다. 부하 생성기는 서버와 같은 JVM이라
+     *   그 비용이 서버 CPU를 잠식할 수 있다. 스위치가 없으면 "이 코드만 뺀" 실행을 만들 수 없어
+     *   처리량 변화가 이 코드 탓인지 실행 간 노이즈인지 영영 못 가른다.
+     *   켜고/끄고를 같은 빌드·같은 세션에서 돌리면 JIT·MySQL 캐시·머신 상태가 같아 노이즈가 상쇄된다.
+     */
+    private final boolean useRejectionHint = Boolean.getBoolean("load.rejectionHint");
+
     @LocalServerPort int port;
     @Autowired UserRepository userRepository;
     @Autowired AuctionRepository auctionRepository;
@@ -471,7 +486,8 @@ class HotAuctionLoadTest {
             }
         }
         StringBuilder sb = new StringBuilder();
-        sb.append(String.format("%n━━ 동시성 스윕 ━━ 구독자 %d / 각 %d초 ━━%n", subscriberCount, durationSeconds));
+        sb.append(String.format("%n━━ 동시성 스윕 ━━ 구독자 %d / 각 %d초 / 거절힌트 %s ━━%n",
+                subscriberCount, durationSeconds, useRejectionHint ? "ON" : "OFF"));
         sb.append(String.format("%-8s %9s %8s %9s %9s %9s %9s %9s %9s%n",
                 "입찰자", "성공/s", "거절률", "응답p50", "응답p95", "전파p95", "(a)p95", "(b)p95", "pending"));
         for (PhaseResult r : results) {
@@ -516,7 +532,10 @@ class HotAuctionLoadTest {
                     // [안내받은 금액을 반영한다] 서버가 유효 입찰가를 주므로 다음 입찰이 그 위에서 시작한다.
                     // 실사용자의 "안내 보고 다시 누름"을 흉내내는 것이다. thinkMillis 간격은 그대로라
                     // 재시도 폭풍이 되지 않는다.
-                    long minimumBid = parseMinimumBid(response.body());
+                    //
+                    // [기본 꺼짐 — useRejectionHint 참조] 켠 실행과 끈 실행을 같은 빌드에서 돌려
+                    // 이 코드의 순수 효과를 실행 간 노이즈와 분리한다.
+                    long minimumBid = useRejectionHint ? parseMinimumBid(response.body()) : -1;
                     if (minimumBid > 0) {
                         // [왜 minimumBid - INCREMENT 인가]
                         //   다음 입찰액 = latestPrice + INCREMENT * (1..3) 이라 증가분의 하한이 INCREMENT다.
@@ -690,7 +709,9 @@ class HotAuctionLoadTest {
         StringBuilder sb = new StringBuilder();
         sb.append(String.format("%n━━ 인기 경매 부하 ━━ 구독자 %d / 입찰자 %d / %d초 ━━%n",
                 subscriberCount, phaseBidders, durationSeconds));
-        sb.append(String.format("DB: %s%n", databaseProduct()));
+        // 리포트만 보고 어느 모드로 돌린 결과인지 알 수 있어야 나중에 두 실행을 비교할 수 있다.
+        sb.append(String.format("DB: %s   거절힌트: %s%n",
+                databaseProduct(), useRejectionHint ? "ON (-Dload.rejectionHint=true)" : "OFF (기준선 조건)"));
 
         sb.append(String.format("%n[응답]%n"));
         sb.append(String.format("  입찰 API 응답        p50 %6.1fms   p95 %6.1fms   p99 %6.1fms%n",
