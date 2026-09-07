@@ -145,6 +145,29 @@ class BidControllerTest {
         assertThat(res.statusCode()).isEqualTo(200);
     }
 
+    /**
+     * [하위호환] ApiResponse.failure에 data 오버로드를 추가한 뒤에도
+     * 부가 정보가 없는 에러는 응답 JSON이 그대로여야 한다.
+     * 이 테스트가 깨지면 기존 프론트의 에러 처리가 함께 깨진다.
+     */
+    @Test
+    void 없는_경매_입찰은_404이고_data는_여전히_null이다() throws Exception {
+        String missingPublicId = "01HZX0000000000000000000ZZ"; // 형식만 맞는 존재하지 않는 ULID
+
+        HttpRequest req = HttpRequest.newBuilder()
+                .uri(URI.create(url("/api/v1/auctions/" + missingPublicId + "/bids")))
+                .header("Content-Type", "application/json")
+                .header("Authorization", "Bearer " + bidderToken)
+                .POST(HttpRequest.BodyPublishers.ofString("{\"amount\":20000}"))
+                .build();
+
+        HttpResponse<String> res = http.send(req, HttpResponse.BodyHandlers.ofString());
+
+        assertThat(res.statusCode()).isEqualTo(404);
+        assertThat(res.body()).contains("\"code\":\"AUCTION_NOT_FOUND\"");
+        assertThat(res.body()).contains("\"data\":null");
+    }
+
     private HttpResponse<String> get(String path) throws Exception {
         HttpRequest req = HttpRequest.newBuilder().uri(URI.create(url(path))).GET().build();
         return http.send(req, HttpResponse.BodyHandlers.ofString());

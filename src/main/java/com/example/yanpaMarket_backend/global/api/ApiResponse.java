@@ -45,4 +45,15 @@ public record ApiResponse<T>(
     public static ApiResponse<Void> failure(String message, String code) {
         return new ApiResponse<>(false, null, message, code); // success=false, data 없음
     }
+
+    /**
+     * [실패 + 부가 정보] 클라이언트가 다음 행동을 정하는 데 필요한 숫자를 함께 내려보낼 때 사용.
+     * 예) BID_TOO_LOW 에 "얼마 이상이어야 하는지"를 실어 재시도를 확정으로 만든다.
+     *
+     * 기존 failure(message, code)는 그대로 남는다 — 대부분의 에러는 부가 정보가 없고,
+     * 그 응답 JSON은 이 확장 이후에도 한 글자도 바뀌지 않는다.
+     */
+    public static <T> ApiResponse<T> failure(String message, String code, T data) {
+        return new ApiResponse<>(false, data, message, code);
+    }
 }
