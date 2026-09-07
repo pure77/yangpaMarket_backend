@@ -169,6 +169,10 @@ class HotAuctionLoadTest {
     /** 최소 입찰 인상폭. Auction 생성자의 minimumBidIncrement와 같아야 한다. */
     private static final long INCREMENT = 10_000L;
 
+    /** BID_TOO_LOW 응답의 minimumBid 추출용. 매 요청마다 컴파일하지 않도록 상수로 둔다. */
+    private static final java.util.regex.Pattern MINIMUM_BID_PATTERN =
+            java.util.regex.Pattern.compile("\"minimumBid\"\\s*:\\s*(\\d+)");
+
     private final int subscriberCount = Integer.getInteger("load.subscribers", 100);
     private final int bidderCount = Integer.getInteger("load.bidders", 20);
     private final int durationSeconds = Integer.getInteger("load.seconds", 60);
@@ -507,7 +511,21 @@ class HotAuctionLoadTest {
                     metrics.created201.incrementAndGet();
                     metrics.latestPrice.accumulateAndGet(amount, Math::max);
                 }
-                case 400 -> metrics.tooLow400.incrementAndGet();  // BID_TOO_LOW — 경합에서 밀림(정상)
+                case 400 -> {
+                    metrics.tooLow400.incrementAndGet(); // BID_TOO_LOW — 경합에서 밀림(정상)
+                    // [안내받은 금액을 반영한다] 서버가 유효 입찰가를 주므로 다음 입찰이 그 위에서 시작한다.
+                    // 실사용자의 "안내 보고 다시 누름"을 흉내내는 것이다. thinkMillis 간격은 그대로라
+                    // 재시도 폭풍이 되지 않는다.
+                    long minimumBid = parseMinimumBid(response.body());
+                    if (minimumBid > 0) {
+                        // [왜 minimumBid - INCREMENT 인가]
+                        //   다음 입찰액 = latestPrice + INCREMENT * (1..3) 이라 증가분의 하한이 INCREMENT다.
+                        //   latestPrice를 minimumBid - INCREMENT로 두면 최악의 경우(배수 1)에도
+                        //   다음 입찰이 반드시 minimumBid 이상이 된다.
+                        //   서버의 minimumBidIncrement 값을 가정하지 않는다는 점이 중요하다.
+                        metrics.latestPrice.accumulateAndGet(minimumBid - INCREMENT, Math::max);
+                    }
+                }
                 case 409 -> metrics.conflict409.incrementAndGet(); // 락이 뚫린 신호
                 case 500 -> metrics.serverError500.incrementAndGet();
                 default -> metrics.otherStatus.incrementAndGet();
@@ -515,6 +533,21 @@ class HotAuctionLoadTest {
         } catch (Exception e) {
             metrics.ioError.incrementAndGet();
         }
+    }
+
+    /**
+     * BID_TOO_LOW 응답 body에서 minimumBid 값을 꺼낸다. 없으면 -1.
+     *
+     * [왜 정규식인가] 응답 형태가 {"success":false,"data":{"currentPrice":N,"minimumBid":M},...} 로
+     * 고정돼 있고, 이 클래스는 부하 생성기라 ObjectMapper를 끌어오면 매 요청마다 역직렬화 비용이
+     * 측정에 섞인다. 실패해도 -1을 돌려주고 조용히 넘어가면 되는 자리다.
+     */
+    private static long parseMinimumBid(String body) {
+        if (body == null) {
+            return -1;
+        }
+        java.util.regex.Matcher matcher = MINIMUM_BID_PATTERN.matcher(body);
+        return matcher.find() ? Long.parseLong(matcher.group(1)) : -1;
     }
 
     /** 구독자가 BID_UPDATE를 받을 때마다 전파 지연/팬아웃을 기록하고 현재가를 갱신한다. */
