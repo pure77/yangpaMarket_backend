@@ -83,8 +83,8 @@ import org.springframework.web.socket.sockjs.client.WebSocketTransport;
  *   리포트: 콘솔 + build/reports/load/hot-auction-{시각}.txt
  *
  * [측정 분해 — 전부 "요청별"로 확정한다]
- *   POST 전송 ─┐  ← 클라이언트 시작
- *              │ 네트워크+클라이언트 = 응답 - 서버처리   (같은 JVM이면 여기가 부풀어 오른다)
+ *   POST 전송 ─┐  ← 입찰 스레드 시작
+ *              │ 네트워크+부하생성기 = 응답 - 서버처리   (같은 JVM이면 여기가 부풀어 오른다)
  *              ├─ 서버 처리 합계                        ← ServerTimingFilter가 직접 측정
  *              │    (a) 진입·조회 = 서버처리 - 락구간    JWT 필터 + 락 밖 조회 2회
  *              │    (b) 락 대기                          ← TimingBidLock
@@ -95,7 +95,7 @@ import org.springframework.web.socket.sockjs.client.WebSocketTransport;
  *   MESSAGE ───┘
  *
  *   [왜 요청별인가] 예전엔 백분위끼리 뺐다(p95(응답) - p95(락)). 그런데
- *   p95(A+B) != p95(A)+p95(B)라 존재하지 않는 값이 나오고, 클라이언트 비용까지 섞였다.
+ *   p95(A+B) != p95(A)+p95(B)라 존재하지 않는 값이 나오고, 부하 생성기 비용까지 섞였다.
  *   지금은 RequestTiming(ThreadLocal)으로 한 요청의 구간들을 모아 필터가 한 번에 기록한다.
  *
  * [주의 — DB가 무엇이냐에 따라 해석이 달라진다]
@@ -237,7 +237,7 @@ class HotAuctionLoadTest {
         final LoadSamples lockHoldSuccess = new LoadSamples();
         final LoadSamples transactionSuccess = new LoadSamples();
         final LoadSamples broadcast = new LoadSamples();       // (d)
-        final LoadSamples responseTime = new LoadSamples();    // 입찰 API 응답 (클라이언트 측정)
+        final LoadSamples responseTime = new LoadSamples();    // 입찰 API 응답 (입찰 스레드 측정)
         final LoadSamples propagation = new LoadSamples();     // POST 전송 → 구독자 수신
         final LoadSamples fanout = new LoadSamples();          // (f) 발행 → 구독자 수신
 
@@ -601,7 +601,7 @@ class HotAuctionLoadTest {
                                int phaseBidders, int bidCountDelta) {
         double wallSeconds = wallNanos / 1_000_000_000.0;
 
-        // 클라이언트 측정
+        // 입찰 스레드 측정 — POST 보내고 답 받기까지
         double respP50 = metrics.responseTime.percentileMillis(0.50);
         double respP95 = metrics.responseTime.percentileMillis(0.95);
         double respP99 = metrics.responseTime.percentileMillis(0.99);
@@ -620,9 +620,9 @@ class HotAuctionLoadTest {
         double castP50 = metrics.broadcast.percentileMillis(0.50);
         double castP95 = metrics.broadcast.percentileMillis(0.95);
 
-        // 하네스 몫: 클라이언트 응답 - 서버 처리. 같은 JVM이면 여기가 부풀어 오른다.
-        double clientP50 = Math.max(0, respP50 - srvP50);
-        double clientP95 = Math.max(0, respP95 - srvP95);
+        // 부하 생성기 몫: 입찰 스레드 응답 - 서버 처리. 같은 JVM이면 여기가 부풀어 오른다.
+        double generatorP50 = Math.max(0, respP50 - srvP50);
+        double generatorP95 = Math.max(0, respP95 - srvP95);
 
         double propP50 = metrics.propagation.percentileMillis(0.50);
         double propP95 = metrics.propagation.percentileMillis(0.95);
@@ -671,8 +671,8 @@ class HotAuctionLoadTest {
         sb.append(segment("  (b) 락 대기", waitP50, waitP95, srvP95));
         sb.append(segment("  (c) 트랜잭션", txP50, txP95, srvP95));
         sb.append(segment("  (d) broadcast", castP50, castP95, srvP95));
-        sb.append(String.format("  %-26s %6.1fms / %6.1fms   %s%n", "네트워크+클라이언트", clientP50, clientP95,
-                clientP95 > srvP95 ? "<- 부하생성기가 같은 JVM. 서버 성능 아님" : ""));
+        sb.append(String.format("  %-26s %6.1fms / %6.1fms   %s%n", "네트워크+부하 생성기", generatorP50, generatorP95,
+                generatorP95 > srvP95 ? "<- 부하 생성기가 같은 JVM. 서버 성능 아님" : ""));
         sb.append(String.format("  %-26s %6.1fms / %6.1fms%n", "(f) 팬아웃", fanP50, fanP95));
 
         sb.append(String.format("%n[락]%n"));
@@ -715,7 +715,7 @@ class HotAuctionLoadTest {
                 bidCountDelta, created, consistent ? "OK" : "FAIL", persistedBids));
 
         sb.append(String.format("%n[판정 힌트] %s%n",
-                verdict(entryP95, waitP95, txP95, castP95, srvP95, clientP95, holdP95)));
+                verdict(entryP95, waitP95, txP95, castP95, srvP95, generatorP95, holdP95)));
         return sb.toString();
     }
 
@@ -760,17 +760,17 @@ class HotAuctionLoadTest {
 
     /**
      * 어디가 병목인지 한 줄로 요약한다.
-     * 서버 내부 구간끼리만 비교하고, 하네스 비용이 서버보다 크면 그 사실을 먼저 알린다.
+     * 서버 내부 구간끼리만 비교하고, 부하 생성기 비용이 서버보다 크면 그 사실을 먼저 알린다.
      */
     private String verdict(double entry, double wait, double tx, double cast,
-                           double server, double client, double hold) {
+                           double server, double generator, double hold) {
         if (server == 0) {
             return "샘플 부족 — 지속 시간을 늘리거나 입찰자를 늘려볼 것";
         }
-        if (client > server) {
+        if (generator > server) {
             return String.format(
-                    "하네스 비용(%.1fms)이 서버 처리(%.1fms)보다 큼 — 부하생성기가 같은 JVM이라 생기는 왜곡. "
-                            + "서버 병목 판단은 [구간 분해]의 서버 내부 항목끼리만 할 것", client, server);
+                    "부하 생성기 비용(%.1fms)이 서버 처리(%.1fms)보다 큼 — 같은 JVM에서 돌아서 생기는 왜곡. "
+                            + "서버 병목 판단은 [구간 분해]의 서버 내부 항목끼리만 할 것", generator, server);
         }
         boolean poolStarved = metrics.poolPendingSamples.get() > metrics.poolSamples.get() * 0.2;
         double max = Math.max(Math.max(entry, wait), Math.max(tx, cast));
