@@ -169,29 +169,10 @@ class HotAuctionLoadTest {
     /** 최소 입찰 인상폭. Auction 생성자의 minimumBidIncrement와 같아야 한다. */
     private static final long INCREMENT = 10_000L;
 
-    /** BID_TOO_LOW 응답의 minimumBid 추출용. 매 요청마다 컴파일하지 않도록 상수로 둔다. */
-    private static final java.util.regex.Pattern MINIMUM_BID_PATTERN =
-            java.util.regex.Pattern.compile("\"minimumBid\"\\s*:\\s*(\\d+)");
-
     private final int subscriberCount = Integer.getInteger("load.subscribers", 100);
     private final int bidderCount = Integer.getInteger("load.bidders", 20);
     private final int durationSeconds = Integer.getInteger("load.seconds", 60);
     private final int thinkMillis = Integer.getInteger("load.thinkMillis", 100);
-
-    /**
-     * [무엇] 거절(400) 응답의 minimumBid를 다음 입찰에 반영할지. `-Dload.rejectionHint=true`로 켠다.
-     *
-     * [왜 기본이 꺼짐인가]
-     *   기준선 수치가 이 기능이 없던 시절에 측정됐다. 기본을 켜두면 아무 옵션 없이 돌린 결과가
-     *   기준선과 비교 불가능해진다. 꺼짐이 기본이어야 "옵션 없는 실행 = 기준선과 같은 조건"이 유지된다.
-     *
-     * [왜 스위치가 필요한가]
-     *   이 파싱은 거절률이 높은 구간에서 요청의 대부분에 대해 돈다. 부하 생성기는 서버와 같은 JVM이라
-     *   그 비용이 서버 CPU를 잠식할 수 있다. 스위치가 없으면 "이 코드만 뺀" 실행을 만들 수 없어
-     *   처리량 변화가 이 코드 탓인지 실행 간 노이즈인지 영영 못 가른다.
-     *   켜고/끄고를 같은 빌드·같은 세션에서 돌리면 JIT·MySQL 캐시·머신 상태가 같아 노이즈가 상쇄된다.
-     */
-    private final boolean useRejectionHint = Boolean.getBoolean("load.rejectionHint");
 
     @LocalServerPort int port;
     @Autowired UserRepository userRepository;
@@ -486,8 +467,7 @@ class HotAuctionLoadTest {
             }
         }
         StringBuilder sb = new StringBuilder();
-        sb.append(String.format("%n━━ 동시성 스윕 ━━ 구독자 %d / 각 %d초 / 거절힌트 %s ━━%n",
-                subscriberCount, durationSeconds, useRejectionHint ? "ON" : "OFF"));
+        sb.append(String.format("%n━━ 동시성 스윕 ━━ 구독자 %d / 각 %d초 ━━%n", subscriberCount, durationSeconds));
         sb.append(String.format("%-8s %9s %8s %9s %9s %9s %9s %9s %9s%n",
                 "입찰자", "성공/s", "거절률", "응답p50", "응답p95", "전파p95", "(a)p95", "(b)p95", "pending"));
         for (PhaseResult r : results) {
@@ -527,24 +507,14 @@ class HotAuctionLoadTest {
                     metrics.created201.incrementAndGet();
                     metrics.latestPrice.accumulateAndGet(amount, Math::max);
                 }
-                case 400 -> {
-                    metrics.tooLow400.incrementAndGet(); // BID_TOO_LOW — 경합에서 밀림(정상)
-                    // [안내받은 금액을 반영한다] 서버가 유효 입찰가를 주므로 다음 입찰이 그 위에서 시작한다.
-                    // 실사용자의 "안내 보고 다시 누름"을 흉내내는 것이다. thinkMillis 간격은 그대로라
-                    // 재시도 폭풍이 되지 않는다.
-                    //
-                    // [기본 꺼짐 — useRejectionHint 참조] 켠 실행과 끈 실행을 같은 빌드에서 돌려
-                    // 이 코드의 순수 효과를 실행 간 노이즈와 분리한다.
-                    long minimumBid = useRejectionHint ? parseMinimumBid(response.body()) : -1;
-                    if (minimumBid > 0) {
-                        // [왜 minimumBid - INCREMENT 인가]
-                        //   다음 입찰액 = latestPrice + INCREMENT * (1..3) 이라 증가분의 하한이 INCREMENT다.
-                        //   latestPrice를 minimumBid - INCREMENT로 두면 최악의 경우(배수 1)에도
-                        //   다음 입찰이 반드시 minimumBid 이상이 된다.
-                        //   서버의 minimumBidIncrement 값을 가정하지 않는다는 점이 중요하다.
-                        metrics.latestPrice.accumulateAndGet(minimumBid - INCREMENT, Math::max);
-                    }
-                }
+                // [왜 거절 응답의 minimumBid를 반영하지 않나 — 측정으로 확인했다]
+                //   서버는 BID_TOO_LOW에 유효 입찰가를 실어 보낸다. 그걸 읽어 다음 입찰에 쓰도록
+                //   해봤지만 A/B 측정에서 효과가 0이었다(차이 ±7% 이내, 방향 불일치, 거절률 동일).
+                //   이유: 아래 frameHandler가 구독자의 BID_UPDATE마다 latestPrice를 갱신하고 있어
+                //   생성기는 이미 현재가를 알고 있다. 거절 응답이 새로 주는 정보가 없다.
+                //   거절의 원인은 정보 부족이 아니라 여러 스레드가 같은 latestPrice로 동시에
+                //   같은 금액을 만들어 던지는 것이다 — 정보를 아무리 신선하게 줘도 안 바뀐다.
+                case 400 -> metrics.tooLow400.incrementAndGet();  // BID_TOO_LOW — 경합에서 밀림(정상)
                 case 409 -> metrics.conflict409.incrementAndGet(); // 락이 뚫린 신호
                 case 500 -> metrics.serverError500.incrementAndGet();
                 default -> metrics.otherStatus.incrementAndGet();
@@ -552,21 +522,6 @@ class HotAuctionLoadTest {
         } catch (Exception e) {
             metrics.ioError.incrementAndGet();
         }
-    }
-
-    /**
-     * BID_TOO_LOW 응답 body에서 minimumBid 값을 꺼낸다. 없으면 -1.
-     *
-     * [왜 정규식인가] 응답 형태가 {"success":false,"data":{"currentPrice":N,"minimumBid":M},...} 로
-     * 고정돼 있고, 이 클래스는 부하 생성기라 ObjectMapper를 끌어오면 매 요청마다 역직렬화 비용이
-     * 측정에 섞인다. 실패해도 -1을 돌려주고 조용히 넘어가면 되는 자리다.
-     */
-    private static long parseMinimumBid(String body) {
-        if (body == null) {
-            return -1;
-        }
-        java.util.regex.Matcher matcher = MINIMUM_BID_PATTERN.matcher(body);
-        return matcher.find() ? Long.parseLong(matcher.group(1)) : -1;
     }
 
     /** 구독자가 BID_UPDATE를 받을 때마다 전파 지연/팬아웃을 기록하고 현재가를 갱신한다. */
@@ -709,9 +664,7 @@ class HotAuctionLoadTest {
         StringBuilder sb = new StringBuilder();
         sb.append(String.format("%n━━ 인기 경매 부하 ━━ 구독자 %d / 입찰자 %d / %d초 ━━%n",
                 subscriberCount, phaseBidders, durationSeconds));
-        // 리포트만 보고 어느 모드로 돌린 결과인지 알 수 있어야 나중에 두 실행을 비교할 수 있다.
-        sb.append(String.format("DB: %s   거절힌트: %s%n",
-                databaseProduct(), useRejectionHint ? "ON (-Dload.rejectionHint=true)" : "OFF (기준선 조건)"));
+        sb.append(String.format("DB: %s%n", databaseProduct()));
 
         sb.append(String.format("%n[응답]%n"));
         sb.append(String.format("  입찰 API 응답        p50 %6.1fms   p95 %6.1fms   p99 %6.1fms%n",

@@ -48,10 +48,8 @@ tasks.named('test') {
 	// [부하 테스트 스위치] HotAuctionLoadTest는 평소엔 건너뛴다(수십 초 걸림).
 	// 돌릴 때만: ./gradlew.bat test --tests '*HotAuctionLoadTest*' -Dloadtest=true
 	// 파라미터도 같은 방식으로 넘긴다: -Dload.subscribers=100 -Dload.bidders=20 -Dload.seconds=60
-	// load.rejectionHint: 거절 응답의 minimumBid를 다음 입찰에 반영할지(기본 꺼짐).
-	//   켠 실행/끈 실행을 같은 빌드에서 돌려 그 코드의 순수 효과를 노이즈와 분리한다.
 	['loadtest', 'load.profile', 'load.subscribers', 'load.bidders', 'load.seconds', 'load.thinkMillis',
-	 'load.poolSize', 'load.sweep', 'load.rejectionHint'].each { key ->
+	 'load.poolSize', 'load.sweep'].each { key ->
 		if (System.getProperty(key) != null) {
 			systemProperty key, System.getProperty(key)
 		}
