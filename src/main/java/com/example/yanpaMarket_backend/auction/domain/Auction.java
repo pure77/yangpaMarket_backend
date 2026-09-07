@@ -1,5 +1,6 @@
 package com.example.yanpaMarket_backend.auction.domain; // auction.domain = 경매 도메인 패키지
 
+import com.example.yanpaMarket_backend.auction.dto.BidTooLowData;
 import com.example.yanpaMarket_backend.common.domain.BaseTimeEntity;
 import com.example.yanpaMarket_backend.global.error.ApiException;
 import com.example.yanpaMarket_backend.global.error.ErrorCode;
@@ -316,8 +317,11 @@ public class Auction extends BaseTimeEntity {
         //   WebSocket broadcast도 그만큼 나가 성능과 UX가 동시에 나빠진다.
         //   [왜 상수가 아니라 필드인가] 경매별로 다르게 설정할 여지를 남긴 것.
         //   "시작가의 5%" 같은 정책이 생겨도 스키마 변경 없이 코드만 바꾸면 된다.
+        //   [거절에 숫자를 싣는다] 클라이언트가 "얼마여야 하는지"를 알아야 재시도가 추측이 아니게 된다.
+        //   경합 구간에서는 응답을 기다리는 사이 현재가가 올라 대부분의 입찰이 여기서 걸린다.
         if (amount < currentPrice + minimumBidIncrement) {
-            throw new ApiException(ErrorCode.BID_TOO_LOW);
+            throw ApiException.withData(ErrorCode.BID_TOO_LOW,
+                    new BidTooLowData(currentPrice, currentPrice + minimumBidIncrement));
         }
         // 통과 시 딱 두 값만 갱신한다. highestBidId는 Bid가 아직 저장 전이라 PK가 없어 건드릴 수 없다.
         this.currentPrice = amount;

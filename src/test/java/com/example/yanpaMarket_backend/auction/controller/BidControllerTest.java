@@ -168,6 +168,27 @@ class BidControllerTest {
         assertThat(res.body()).contains("\"data\":null");
     }
 
+    /**
+     * [end-to-end] 거절 응답이 실제 JSON에 숫자를 싣는지 확인한다.
+     * setUp의 경매는 startPrice=10000 → 현재가 10000, 인상폭 10000이라 유효 입찰가는 20000이다.
+     */
+    @Test
+    void 인상폭_미달_입찰은_400과_유효_입찰가를_반환한다() throws Exception {
+        HttpRequest req = HttpRequest.newBuilder()
+                .uri(URI.create(url("/api/v1/auctions/" + auctionPublicId + "/bids")))
+                .header("Content-Type", "application/json")
+                .header("Authorization", "Bearer " + bidderToken)
+                .POST(HttpRequest.BodyPublishers.ofString("{\"amount\":15000}"))
+                .build();
+
+        HttpResponse<String> res = http.send(req, HttpResponse.BodyHandlers.ofString());
+
+        assertThat(res.statusCode()).isEqualTo(400);
+        assertThat(res.body()).contains("\"code\":\"BID_TOO_LOW\"");
+        assertThat(res.body()).contains("\"currentPrice\":10000");
+        assertThat(res.body()).contains("\"minimumBid\":20000");
+    }
+
     private HttpResponse<String> get(String path) throws Exception {
         HttpRequest req = HttpRequest.newBuilder().uri(URI.create(url(path))).GET().build();
         return http.send(req, HttpResponse.BodyHandlers.ofString());
