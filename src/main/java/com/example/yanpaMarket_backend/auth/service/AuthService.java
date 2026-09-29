@@ -177,7 +177,13 @@ public class AuthService {
             throw new ApiException(ErrorCode.UNAUTHORIZED, "유효하지 않은 refresh token입니다.");
         }
         refreshTokenStore.revoke(request.refreshToken()); // 기존 refresh 폐기 (토큰 회전: 재사용 차단)
-        return issueTokens(user);                         // 새 access/refresh 한 쌍 발급
+        try {
+            return issueTokens(user);                     // 새 access/refresh 한 쌍 발급
+        } catch (DataIntegrityViolationException exception) {
+            // 동시에 여러 번 갱신 요청이 들어와 토큰 저장이 충돌한 경우.
+            // 여기서 잡지 않으면 DB 예외가 그대로 500으로 새어 나간다.
+            throw new ApiException(ErrorCode.CONFLICT, "토큰 갱신이 동시에 요청되었습니다. 다시 시도해주세요.");
+        }
     }
 
     /**
