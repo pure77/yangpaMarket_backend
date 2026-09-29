@@ -167,6 +167,31 @@ public class AuthService {
     }
 
     /**
+     * [테스트 전용] 카카오 없이 닉네임 기반으로 테스트 계정을 확보한 뒤 실제 로그인 토큰을 발급합니다.
+     * - 같은 닉네임(→ 같은 email)이면 기존 계정을 재사용하므로 반복 호출해도 계정이 중복 생성되지 않습니다.
+     * - 생성되는 계정은 status=ACTIVE + nickname/phone 보유 → isCompleteUser 조건을 만족(정상 로그인 사용자).
+     * - dev 프로필의 DevAuthController에서만 호출되며, 운영 환경에서는 진입 경로 자체가 없습니다.
+     */
+    public TokenResponse devLogin(String nickname) {
+        String email = nickname + "@test.local"; // 닉네임을 유일 이메일로 매핑 → 재호출 시 동일 계정 조회
+        User user = userRepository.findByEmail(email).orElseGet(() ->
+                userRepository.save(
+                        User.builder()
+                                .publicId(generatePublicId())           // 외부 노출용 식별자(JWT subject)
+                                .email(email)
+                                .passwordHash(null)                     // 소셜/테스트 계정 → 비밀번호 없음
+                                .nickname(nickname)
+                                .phone(generateTestPhone(nickname))     // phone 유니크 제약 회피용 결정적 번호
+                                .isAdmin(false)
+                                .status(UserStatus.ACTIVE)
+                                .marketingOptIn(false)
+                                .build()
+                )
+        );
+        return issueTokens(user); // 기존 토큰 발급 로직 그대로 재사용(진짜 access/refresh 발급)
+    }
+
+    /**
      * refresh token을 검증한 뒤 기존 refresh를 폐기하고 새 access/refresh를 재발급합니다.
      */
     public TokenResponse refresh(RefreshTokenRequest request) {
@@ -369,6 +394,13 @@ public class AuthService {
     // 외부 노출용 publicId 생성 (UUID에서 하이픈 제거)
     private String generatePublicId() {
         return UUID.randomUUID().toString().replace("-", "");
+    }
+
+    // [테스트 전용] 닉네임에서 결정적(deterministic) 테스트용 전화번호 생성.
+    // phone 유니크 제약을 피하려고 닉네임 해시로 8자리 뒷번호를 만든다("010" + 8자리).
+    private String generateTestPhone(String nickname) {
+        int suffix = Math.abs(nickname.hashCode()) % 100_000_000; // 0 ~ 99,999,999 범위
+        return "010" + String.format("%08d", suffix);
     }
 
     // null 또는 공백 문자열 여부
