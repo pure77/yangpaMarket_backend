@@ -9,7 +9,7 @@ version = '0.0.1-SNAPSHOT'
 
 java {
 	toolchain {
-		languageVersion = JavaLanguageVersion.of(17)
+		languageVersion = JavaLanguageVersion.of(18)
 	}
 }
 
@@ -26,6 +26,8 @@ dependencies {
 	implementation 'org.flywaydb:flyway-core'
 	implementation 'com.github.f4b6a3:ulid-creator:5.2.3'
 	implementation 'io.jsonwebtoken:jjwt-api:0.12.6'
+	implementation platform('software.amazon.awssdk:bom:2.28.16')
+	implementation 'software.amazon.awssdk:s3'
 	compileOnly 'org.projectlombok:lombok'
 	runtimeOnly 'com.mysql:mysql-connector-j'
 	runtimeOnly 'io.jsonwebtoken:jjwt-impl:0.12.6'
@@ -42,4 +44,14 @@ dependencies {
 
 tasks.named('test') {
 	useJUnitPlatform()
+
+	// [부하 테스트 스위치] HotAuctionLoadTest는 평소엔 건너뛴다(수십 초 걸림).
+	// 돌릴 때만: ./gradlew.bat test --tests '*HotAuctionLoadTest*' -Dloadtest=true
+	// 파라미터도 같은 방식으로 넘긴다: -Dload.subscribers=100 -Dload.bidders=20 -Dload.seconds=60
+	['loadtest', 'load.profile', 'load.subscribers', 'load.bidders', 'load.seconds', 'load.thinkMillis',
+	 'load.poolSize', 'load.sweep'].each { key ->
+		if (System.getProperty(key) != null) {
+			systemProperty key, System.getProperty(key)
+		}
+	}
 }

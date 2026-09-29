@@ -11,6 +11,7 @@ import java.time.Instant;                 // 시각(발급/만료 계산)
 import java.util.Date;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.UUID;                  // jti(토큰 고유 ID) 생성용
 import javax.crypto.SecretKey;            // HMAC 서명용 비밀키
 import org.springframework.stereotype.Component; // 스프링 빈 등록
 
@@ -139,6 +140,12 @@ public class JwtProvider {
     /**
      * [내부 공통] 실제 JWT를 만드는 함수.
      * tokenType 클레임을 반드시 넣어 access/refresh/signup을 구분한다.
+     *
+     * [중요] jti(고유 ID)를 반드시 포함시킨다.
+     *   JWT의 iat/exp는 "초 단위"라, jti가 없으면 같은 사용자에게 같은 초 안에 발급한 토큰이
+     *   문자열까지 완전히 동일해진다. refresh 토큰은 SHA-256 해시로 DB에 저장되고
+     *   token_hash에 유니크 제약이 걸려 있어, 중복 토큰은 INSERT 실패(500)로 이어졌다.
+     *   jti를 넣으면 발급 시각과 무관하게 항상 서로 다른 토큰이 된다.
      */
     private String createToken(String publicId, TokenType tokenType, long expirationSeconds, Map<String, Object> extraClaims) {
         Instant now = Instant.now();
@@ -146,6 +153,7 @@ public class JwtProvider {
                 .subject(publicId)                       // 토큰 주인(사용자 식별자)
                 .claims(extraClaims)                      // 추가 클레임(isAdmin, 카카오 정보 등)
                 .claim("tokenType", tokenType.name())    // 용도 구분 클레임
+                .id(UUID.randomUUID().toString())        // jti: 매 발급마다 유일 → 초 단위 토큰 중복 방지
                 .issuedAt(Date.from(now))                // 발급 시각
                 .expiration(Date.from(now.plusSeconds(expirationSeconds))) // 만료 시각
                 .signWith(secretKey)                      // 시크릿으로 서명(위조 방지)

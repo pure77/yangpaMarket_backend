@@ -34,10 +34,17 @@ public class MySqlRefreshTokenStore implements RefreshTokenStore {
     /**
      * [세션 교체] 로그인/재발급 시 기존 활성 토큰을 모두 폐기하고 새 토큰 1개만 저장한다.
      * → "한 계정당 활성 세션 1개" 정책.
+     *
+     * [정리] 폐기(revoked) 처리된 과거 행은 여기서 함께 삭제한다.
+     *   폐기 표시만 하고 두면 로그인/갱신을 반복할수록 행이 무한히 쌓이고,
+     *   token_hash 유니크 제약과 맞물려 잠재적 충돌 지점이 된다.
+     *   결과적으로 사용자당 활성 토큰 1행만 유지된다.
      */
     @Override
     public void replace(User user, String refreshToken, Instant expiresAt) {
-        revokeAll(user); // 기존 토큰 전부 폐기
+        revokeAll(user);                                                    // 기존 활성 토큰 전부 폐기
+        authRefreshTokenRepository.flush();                                 // 폐기 상태를 DB에 먼저 반영
+        authRefreshTokenRepository.deleteAllByUserIdAndRevokedTrue(user.getId()); // 폐기된 과거 행 정리
         authRefreshTokenRepository.save(
                 AuthRefreshToken.builder()
                         .user(user)

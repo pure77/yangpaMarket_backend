@@ -1,7 +1,11 @@
 package com.example.yanpaMarket_backend.auction.domain; // 테스트 대상과 같은 패키지
 
 import static org.assertj.core.api.Assertions.assertThat; // 가독성 좋은 검증 메서드(assertThat...)
+import static org.assertj.core.api.Assertions.catchThrowable;
 
+import com.example.yanpaMarket_backend.auction.dto.BidTooLowData;
+import com.example.yanpaMarket_backend.global.error.ApiException;
+import com.example.yanpaMarket_backend.global.error.ErrorCode;
 import java.time.LocalDateTime;
 import org.junit.jupiter.api.Test;
 
@@ -85,5 +89,95 @@ class AuctionTest {
         assertThat(auction.getCancelReason()).isEqualTo("판매자 취소");
         assertThat(auction.getCancelledAt()).isNotNull();
         assertThat(auction.isModifiable()).isFalse(); // 취소 후엔 수정 불가
+    }
+
+    @org.junit.jupiter.api.Test
+    void placeBid는_최소인상폭_이상이면_현재가와_입찰수를_갱신() {
+        LocalDateTime now = LocalDateTime.now();
+        Auction auction = newActiveAuction(now.minusMinutes(1)); // startPrice=10000, increment=10000
+
+        auction.placeBid(2L, 20000L, now);
+
+        assertThat(auction.getCurrentPrice()).isEqualTo(20000L);
+        assertThat(auction.getBidCount()).isEqualTo(1);
+    }
+
+    @org.junit.jupiter.api.Test
+    void placeBid는_현재가더하기최소인상폭_미만이면_BID_TOO_LOW() {
+        LocalDateTime now = LocalDateTime.now();
+        Auction auction = newActiveAuction(now.minusMinutes(1));
+
+        org.assertj.core.api.Assertions.assertThatThrownBy(() -> auction.placeBid(2L, 19999L, now))
+                .isInstanceOf(com.example.yanpaMarket_backend.global.error.ApiException.class)
+                .extracting("errorCode")
+                .isEqualTo(com.example.yanpaMarket_backend.global.error.ErrorCode.BID_TOO_LOW);
+    }
+
+    @org.junit.jupiter.api.Test
+    void placeBid는_판매자_본인이면_SELF_BID_NOT_ALLOWED() {
+        LocalDateTime now = LocalDateTime.now();
+        Auction auction = newActiveAuction(now.minusMinutes(1)); // seller=1L
+
+        org.assertj.core.api.Assertions.assertThatThrownBy(() -> auction.placeBid(1L, 20000L, now))
+                .isInstanceOf(com.example.yanpaMarket_backend.global.error.ApiException.class)
+                .extracting("errorCode")
+                .isEqualTo(com.example.yanpaMarket_backend.global.error.ErrorCode.SELF_BID_NOT_ALLOWED);
+    }
+
+    @org.junit.jupiter.api.Test
+    void placeBid는_종료시각이_지났으면_AUCTION_ENDED() {
+        LocalDateTime now = LocalDateTime.now();
+        Auction auction = newActiveAuction(now.minusDays(2)); // endAt = startAt+1d < now
+
+        org.assertj.core.api.Assertions.assertThatThrownBy(() -> auction.placeBid(2L, 20000L, now))
+                .isInstanceOf(com.example.yanpaMarket_backend.global.error.ApiException.class)
+                .extracting("errorCode")
+                .isEqualTo(com.example.yanpaMarket_backend.global.error.ErrorCode.AUCTION_ENDED);
+    }
+
+    @org.junit.jupiter.api.Test
+    void close는_입찰자가_있으면_PAYMENT_PENDING과_낙찰자를_기록() {
+        LocalDateTime now = LocalDateTime.now();
+        Auction auction = newActiveAuction(now.minusMinutes(1));
+        auction.placeBid(2L, 20000L, now);
+        Bid highest = Bid.create(0L, 2L, 20000L, now); // id는 null(테스트 단위) — 도메인은 객체만 사용
+
+        auction.close(highest, now);
+
+        assertThat(auction.getStatus()).isEqualTo(AuctionStatus.PAYMENT_PENDING);
+        assertThat(auction.getWinnerUserId()).isEqualTo(2L);
+        assertThat(auction.getEndedAt()).isEqualTo(now);
+    }
+
+    @org.junit.jupiter.api.Test
+    void close는_입찰자가_없으면_ENDED() {
+        LocalDateTime now = LocalDateTime.now();
+        Auction auction = newActiveAuction(now.minusMinutes(1));
+
+        auction.close(null, now);
+
+        assertThat(auction.getStatus()).isEqualTo(AuctionStatus.ENDED);
+        assertThat(auction.getWinnerUserId()).isNull();
+        assertThat(auction.getEndedAt()).isEqualTo(now);
+    }
+
+    /**
+     * [규칙 ③] 인상폭 미달 거절 시, 클라이언트가 재시도 금액을 확정할 수 있도록
+     * 현재가와 유효 입찰가를 예외에 실어 던진다.
+     * 이게 없으면 클라이언트는 "낮다"는 것만 알고 얼마여야 하는지 몰라 추측으로 재시도한다.
+     */
+    @Test
+    void 인상폭_미달_거절은_현재가와_유효_입찰가를_함께_알려준다() {
+        LocalDateTime now = LocalDateTime.now();
+        Auction auction = newActiveAuction(now.minusMinutes(1)); // 현재가 10000, 인상폭 10000
+
+        // catchThrowable + 캐스팅을 쓰는 이유: catchThrowableOfType은 AssertJ 버전에 따라
+        // 인자 순서가 달라 깨지기 쉽다.
+        Throwable thrown = catchThrowable(() -> auction.placeBid(2L, 15000L, now));
+
+        assertThat(thrown).isInstanceOf(ApiException.class);
+        ApiException exception = (ApiException) thrown;
+        assertThat(exception.getErrorCode()).isEqualTo(ErrorCode.BID_TOO_LOW);
+        assertThat(exception.getData()).isEqualTo(new BidTooLowData(10000L, 20000L));
     }
 }

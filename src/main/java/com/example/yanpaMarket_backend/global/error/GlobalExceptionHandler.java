@@ -25,12 +25,15 @@ public class GlobalExceptionHandler {
     /**
      * [비즈니스 예외] 서비스가 던진 ApiException 처리.
      * ErrorCode 안의 HTTP 상태와 코드 이름을 그대로 응답에 반영한다.
+     *
+     * exception.getData()는 대부분 null이라 기존 에러 응답은 {"data":null}로 동일하다.
+     * ApiException.withData(...)로 던진 경우에만 값이 실린다.
      */
     @ExceptionHandler(ApiException.class)
-    public ResponseEntity<ApiResponse<Void>> handleApiException(ApiException exception) {
-        ErrorCode errorCode = exception.getErrorCode(); // 예외가 들고 온 에러 종류 꺼내기
-        return ResponseEntity.status(errorCode.getStatus()) // HTTP 상태코드 설정(예: 404)
-                .body(ApiResponse.failure(exception.getMessage(), errorCode.name())); // 바디=실패 응답(메시지 + 코드명)
+    public ResponseEntity<ApiResponse<Object>> handleApiException(ApiException exception) {
+        ErrorCode errorCode = exception.getErrorCode();
+        return ResponseEntity.status(errorCode.getStatus())
+                .body(ApiResponse.failure(exception.getMessage(), errorCode.name(), exception.getData()));
     }
 
     /**

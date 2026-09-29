@@ -20,18 +20,34 @@ public class ApiException extends RuntimeException {
     private final ErrorCode errorCode; // 이 예외가 의미하는 에러 종류(HTTP 상태/기본 메시지 포함)
 
     /**
-     * [기본 메시지 사용] ErrorCode 에 정의된 defaultMessage 를 그대로 예외 메시지로 사용.
+     * 실패 응답의 data 로 그대로 나간다. 대부분의 예외는 null 이다.
+     * [왜 Object 인가] 이 클래스는 "운반"만 한다. 타입은 실제 payload 쪽(예: BidTooLowData)이 갖는다.
      */
+    private final Object data;
+
     public ApiException(ErrorCode errorCode) {
-        super(errorCode.getDefaultMessage()); // RuntimeException 의 message 를 기본 메시지로 설정
-        this.errorCode = errorCode;           // 어떤 에러인지 저장
+        this(errorCode, errorCode.getDefaultMessage(), null);
+    }
+
+    public ApiException(ErrorCode errorCode, String message) {
+        this(errorCode, message, null);
+    }
+
+    private ApiException(ErrorCode errorCode, String message, Object data) {
+        super(message);
+        this.errorCode = errorCode;
+        this.data = data;
     }
 
     /**
-     * [커스텀 메시지] 상황에 맞는 구체적 메시지를 직접 지정하고 싶을 때 사용.
+     * [부가 정보를 실어 던진다] 거절 사유의 숫자를 클라이언트에게 전달해야 할 때만 쓴다.
+     *
+     * [왜 생성자가 아니라 정적 팩토리인가]
+     *   ApiException(ErrorCode, String)이 이미 있다. 여기에 (ErrorCode, Object)를 더하면
+     *   문자열 인자가 어느 쪽으로 가는지 읽는 사람이 헷갈린다(자바는 더 구체적인 String을 고른다).
+     *   이름을 붙여 의도를 드러내는 편이 안전하다.
      */
-    public ApiException(ErrorCode errorCode, String message) {
-        super(message);             // 전달받은 메시지를 예외 메시지로 설정
-        this.errorCode = errorCode; // 에러 종류는 따로 저장(HTTP 상태 결정에 사용)
+    public static ApiException withData(ErrorCode errorCode, Object data) {
+        return new ApiException(errorCode, errorCode.getDefaultMessage(), data);
     }
 }
