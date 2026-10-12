@@ -10,16 +10,19 @@ import com.example.yanpaMarket_backend.auction.dto.BidHistoryResponse;
 import com.example.yanpaMarket_backend.auction.dto.BidRequest;
 import com.example.yanpaMarket_backend.auction.dto.BidResponse;
 import com.example.yanpaMarket_backend.auction.repository.AuctionRepository;
+import com.example.yanpaMarket_backend.common.cache.CacheNames;
 import com.example.yanpaMarket_backend.common.util.PublicIdGenerator;
 import com.example.yanpaMarket_backend.global.error.ApiException;
 import com.example.yanpaMarket_backend.user.domain.User;
 import com.example.yanpaMarket_backend.user.domain.UserStatus;
 import com.example.yanpaMarket_backend.user.repository.UserRepository;
+import com.example.yanpaMarket_backend.user.service.UserSummary;
 import java.time.LocalDateTime;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.cache.CacheManager;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.transaction.annotation.Transactional;
@@ -32,6 +35,7 @@ class BidServiceTest {
     @Autowired private BidService bidService;
     @Autowired private AuctionRepository auctionRepository;
     @Autowired private UserRepository userRepository;
+    @Autowired private CacheManager cacheManager;
 
     private String sellerPublicId;
     private String bidderPublicId;
@@ -80,6 +84,20 @@ class BidServiceTest {
         assertThat(reloaded.getCurrentPrice()).isEqualTo(20000L);
         assertThat(reloaded.getBidCount()).isEqualTo(1);
         assertThat(reloaded.getHighestBidId()).isNotNull();
+    }
+
+    @Test
+    void 입찰하면_락_밖_조회_결과가_캐시에_남는다() {
+        bidService.placeBid(bidderPublicId, auctionPublicId, new BidRequest(20000L));
+
+        // [왜 검사하나] 캐시가 조용히 안 먹히면 동작은 그대로라 기능 테스트로는 모른다.
+        //   입찰 한 번 뒤 두 캐시에 값이 들어 있어야 BidService가 캐시 경로를 탄 것이다.
+        Long auctionId = auctionRepository.findByPublicId(auctionPublicId).orElseThrow().getId();
+        assertThat(cacheManager.getCache(CacheNames.AUCTION_ID_BY_PUBLIC_ID).get(auctionPublicId, Long.class))
+                .isEqualTo(auctionId);
+        assertThat(cacheManager.getCache(CacheNames.USER_SUMMARY_BY_PUBLIC_ID).get(bidderPublicId, UserSummary.class))
+                .isNotNull()
+                .extracting(UserSummary::nickname).isEqualTo("홍길동");
     }
 
     @Test

@@ -3,9 +3,11 @@ package com.example.yanpaMarket_backend.auction.repository; // auction.repositor
 import com.example.yanpaMarket_backend.auction.domain.Auction;
 import com.example.yanpaMarket_backend.auction.domain.AuctionCategory;
 import com.example.yanpaMarket_backend.auction.domain.AuctionStatus;
+import com.example.yanpaMarket_backend.common.cache.CacheNames;
 import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Optional;
+import org.springframework.cache.annotation.Cacheable;
 import org.springframework.data.domain.Page;     // 페이지네이션 결과
 import org.springframework.data.domain.Pageable; // 페이지 요청(번호/크기/정렬)
 import org.springframework.data.jpa.repository.Query; // 직접 작성한 JPQL 쿼리
@@ -32,7 +34,13 @@ public interface AuctionRepository extends JpaRepository<Auction, Long> {
      *   ID만 가져오면 낡은 엔티티가 애초에 컨텍스트에 안 들어가므로 OSIV 설정과 무관하게 안전하다.
      *
      * 존재 확인(404 판정)은 Optional.empty()로 그대로 되고, 읽는 컬럼도 하나뿐이다.
+     *
+     * [캐시] publicId → PK는 절대 바뀌지 않아 서버 메모리에 캐시한다(CacheConfig 참고).
+     *   경매가 삭제돼도 안전하다 — BidService가 락 안에서 findById로 다시 조회해 AUCTION_NOT_FOUND를 던진다.
+     *   unless: 없는 경매(Optional.empty → #result == null)는 캐시하지 않는다.
+     *   없음을 캐시하면 나중에 생긴 경매를 못 찾고, 임의 문자열 요청으로 캐시를 채우는 공격도 가능해진다.
      */
+    @Cacheable(cacheNames = CacheNames.AUCTION_ID_BY_PUBLIC_ID, unless = "#result == null")
     @Query("select a.id from Auction a where a.publicId = :publicId")
     Optional<Long> findIdByPublicId(@Param("publicId") String publicId);
 
