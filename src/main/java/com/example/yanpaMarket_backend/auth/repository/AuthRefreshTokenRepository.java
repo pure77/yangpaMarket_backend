@@ -14,4 +14,8 @@ public interface AuthRefreshTokenRepository extends JpaRepository<AuthRefreshTok
     Optional<AuthRefreshToken> findByTokenHash(String tokenHash); // 토큰 해시로 1건 조회(검증 시 사용)
 
     List<AuthRefreshToken> findAllByUserIdAndRevokedFalse(Long userId); // 특정 사용자의 "아직 폐기 안 된" 토큰 전부 조회(전체 폐기 시 사용)
+
+    // 특정 사용자의 "이미 폐기된" 토큰 행 삭제.
+    // 세션 교체(replace) 시 호출해 revoked 행이 무한히 쌓이는 것을 막는다.
+    void deleteAllByUserIdAndRevokedTrue(Long userId);
 }
