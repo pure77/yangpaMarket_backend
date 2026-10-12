@@ -10,6 +10,8 @@ import com.example.yanpaMarket_backend.common.util.PublicIdGenerator;
 import com.example.yanpaMarket_backend.user.domain.User;
 import com.example.yanpaMarket_backend.user.domain.UserStatus;
 import com.example.yanpaMarket_backend.user.repository.UserRepository;
+import com.example.yanpaMarket_backend.user.service.UserLookupService;
+import com.example.yanpaMarket_backend.user.service.UserSummary;
 import java.time.LocalDateTime;
 import java.util.Optional;
 import org.junit.jupiter.api.BeforeEach;
@@ -36,13 +38,17 @@ class LookupCacheTest {
     @Autowired private AuctionRepository auctionRepository;
     @Autowired private UserRepository userRepository;
     @Autowired private CacheManager cacheManager;
+    @Autowired private UserLookupService userLookupService;
 
     private Cache auctionIdCache;
+    private Cache userSummaryCache;
 
     @BeforeEach
     void setUp() {
         auctionIdCache = cacheManager.getCache(CacheNames.AUCTION_ID_BY_PUBLIC_ID);
         auctionIdCache.clear();
+        userSummaryCache = cacheManager.getCache(CacheNames.USER_SUMMARY_BY_PUBLIC_ID);
+        userSummaryCache.clear();
     }
 
     @Test
@@ -64,6 +70,32 @@ class LookupCacheTest {
 
         assertThat(found).isEmpty();
         assertThat(auctionIdCache.get(unknown)).isNull();
+    }
+
+    @Test
+    void 사용자_요약이_캐시되어_만료_전에는_DB가_바뀌어도_이전_값을_돌려준다() {
+        User user = userRepository.saveAndFlush(user("cache-user@y.com", "홍길동", "010-8000-0002"));
+
+        UserSummary first = userLookupService.findSummaryByPublicId(user.getPublicId()).orElseThrow();
+
+        // DB의 닉네임을 바꾼다. 캐시가 적용됐다면 두 번째 조회는 DB에 가지 않고 이전 값을 돌려준다.
+        user.completeProfile("김철수", "010-8000-0002", false);
+        userRepository.saveAndFlush(user);
+        UserSummary second = userLookupService.findSummaryByPublicId(user.getPublicId()).orElseThrow();
+
+        assertThat(first).isEqualTo(new UserSummary(user.getId(), "홍길동"));
+        assertThat(second.nickname()).isEqualTo("홍길동");
+        assertThat(userSummaryCache.get(user.getPublicId(), UserSummary.class)).isEqualTo(first);
+    }
+
+    @Test
+    void 없는_사용자는_캐시하지_않는다() {
+        String unknown = PublicIdGenerator.newUlid();
+
+        Optional<UserSummary> found = userLookupService.findSummaryByPublicId(unknown);
+
+        assertThat(found).isEmpty();
+        assertThat(userSummaryCache.get(unknown)).isNull();
     }
 
     private Auction auction(Long sellerId) {
