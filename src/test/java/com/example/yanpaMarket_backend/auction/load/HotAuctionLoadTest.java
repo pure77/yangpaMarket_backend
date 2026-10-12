@@ -20,6 +20,11 @@ import com.example.yanpaMarket_backend.user.repository.UserRepository;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.zaxxer.hikari.HikariDataSource;
+import org.apache.tomcat.util.threads.ThreadPoolExecutor;
+import org.springframework.boot.tomcat.TomcatWebServer;
+import org.springframework.boot.web.server.WebServer;
+import org.springframework.boot.web.server.context.WebServerApplicationContext;
+import org.springframework.context.ApplicationContext;
 import java.lang.reflect.Type;
 import java.net.URI;
 import java.net.http.HttpClient;
@@ -38,6 +43,7 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executor;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
@@ -205,6 +211,8 @@ class HotAuctionLoadTest {
     @Autowired JwtProvider jwtProvider;
     @Autowired DataSource dataSource;
     @Autowired LoadMetrics metrics;
+    // Tomcat 요청 스레드풀을 꺼내기 위한 컨텍스트(WebServerApplicationContext로 내장 서버를 얻는다)
+    @Autowired ApplicationContext applicationContext;
 
     // broadcast 소요 시간과 "발행 시각"을 얻기 위해 spy로 감싼다. 실제 전송은 그대로 수행된다.
     @MockitoSpyBean SimpMessagingTemplate messagingTemplate;
@@ -301,6 +309,34 @@ class HotAuctionLoadTest {
         final AtomicInteger poolActiveMax = new AtomicInteger();
         final AtomicInteger poolPendingSamples = new AtomicInteger(); // pending>0 이었던 샘플 수
 
+        // [IO 오류 유형별 집계] 예전엔 catch에서 개수만 세고 예외 종류를 버렸다. 타임아웃(대기열 적체)인지
+        //   연결 거절/리셋(accept 큐 초과)인지 구분이 안 돼서, 유형(+원인) 이름을 키로 개수와 첫 메시지를 모은다.
+        final ConcurrentHashMap<String, AtomicInteger> ioErrorByType = new ConcurrentHashMap<>();
+        final ConcurrentHashMap<String, String> ioErrorSample = new ConcurrentHashMap<>();
+
+        /** 예외 하나를 유형별로 기록한다. 키 = "클래스" 또는 "클래스 ← 원인클래스", 샘플은 유형당 첫 메시지(150자). */
+        void recordIoError(Exception e) {
+            ioError.incrementAndGet();
+            String key = e.getClass().getSimpleName();
+            if (e.getCause() != null) {
+                key += " ← " + e.getCause().getClass().getSimpleName();
+            }
+            ioErrorByType.computeIfAbsent(key, k -> new AtomicInteger()).incrementAndGet();
+            String message = String.valueOf(e.getMessage());
+            ioErrorSample.putIfAbsent(key, message.length() > 150 ? message.substring(0, 150) + "…" : message);
+        }
+
+        // Tomcat 요청 스레드풀 샘플링 (Hikari 샘플러와 같은 스레드가 100ms마다 채운다)
+        // [왜 재나] 입찰 스레드가 maxThreads(기본 200)보다 많으면 요청이 필터에 닿기 전에 Tomcat 큐에서 기다린다.
+        //   이 대기는 ServerTimingFilter 밖이라 "필터 밖" 시간에 섞여 들어간다 — 실제 서버 대기인데 생성기 비용으로 오해되기 쉽다.
+        final AtomicInteger tomcatSamples = new AtomicInteger();
+        final AtomicLong tomcatBusySum = new AtomicLong();
+        final AtomicInteger tomcatBusyMax = new AtomicInteger();
+        final AtomicLong tomcatQueueSum = new AtomicLong();
+        final AtomicInteger tomcatQueueMax = new AtomicInteger();
+        final AtomicInteger tomcatSaturatedSamples = new AtomicInteger(); // busy >= maxThreads 였던 샘플 수
+        final AtomicInteger tomcatQueuedSamples = new AtomicInteger();    // queue > 0 이었던 샘플 수
+
         /** 스윕 모드에서 구간마다 처음부터 다시 재기 위해 전부 비운다. latestPrice는 경매가 이어지므로 남긴다. */
         void reset() {
             serverHandling.reset(); entry.reset(); lockWait.reset(); lockHold.reset();
@@ -312,13 +348,17 @@ class HotAuctionLoadTest {
             serverError500.set(0); otherStatus.set(0); ioError.set(0);
             poolSamples.set(0); poolActiveSum.set(0); poolIdleSum.set(0); poolPendingSum.set(0);
             poolPendingMax.set(0); poolActiveMax.set(0); poolPendingSamples.set(0);
+            ioErrorByType.clear(); ioErrorSample.clear();
+            tomcatSamples.set(0); tomcatBusySum.set(0); tomcatBusyMax.set(0); tomcatQueueSum.set(0);
+            tomcatQueueMax.set(0); tomcatSaturatedSamples.set(0); tomcatQueuedSamples.set(0);
         }
     }
 
     /** 스윕 한 구간의 요약. 마지막에 표로 묶어 "어디서 꺾이는지" 보여준다. */
     record PhaseResult(int auctions, int bidders, double successPerSec, double requestsPerSec, double rejectRate,
                        double respP50, double respP95, double propP95,
-                       double entryP95, double waitP95, double avgPending) {
+                       double entryP95, double waitP95, double avgPending,
+                       double avgTomcatQueue, int ioErrors) {
     }
 
     /** 경매 한 건의 정합성 점검 재료. bidCount 증가분 == 그 경매의 201 응답 수여야 한다. */
@@ -442,7 +482,8 @@ class HotAuctionLoadTest {
                 Thread.sleep(1000); // 구독 등록이 브로커에 반영될 시간
 
                 HikariDataSource hikari = unwrapHikari();
-                Thread poolSampler = startPoolSampler(hikari);
+                ThreadPoolExecutor tomcatPool = unwrapTomcatExecutor();
+                Thread poolSampler = startPoolSampler(hikari, tomcatPool);
                 long wallNanos = runBiddingPhase(activeIds, tokensByAuction, phaseBidders);
                 Thread.sleep(1000);                // 마지막 메시지들이 도착할 시간
                 poolSampler.interrupt();
@@ -461,7 +502,7 @@ class HotAuctionLoadTest {
                             success == null ? 0 : success.get(), persistedBids));
                 }
 
-                String report = buildReport(checks, wallNanos, hikari, phaseAuctions, phaseBidders, sessions.size());
+                String report = buildReport(checks, wallNanos, hikari, tomcatPool, phaseAuctions, phaseBidders, sessions.size());
                 System.out.println(report);
                 writeReport(report, "auctions" + phaseAuctions + "-bidders" + phaseBidders);
                 results.add(snapshot(phaseAuctions, phaseBidders, wallNanos));
@@ -560,7 +601,10 @@ class HotAuctionLoadTest {
                 metrics.propagation.percentileMillis(0.95),
                 metrics.entry.percentileMillis(0.95),
                 metrics.lockWait.percentileMillis(0.95),
-                n > 0 ? metrics.poolPendingSum.get() / (double) n : 0);
+                n > 0 ? metrics.poolPendingSum.get() / (double) n : 0,
+                metrics.tomcatSamples.get() > 0
+                        ? metrics.tomcatQueueSum.get() / (double) metrics.tomcatSamples.get() : 0,
+                metrics.ioError.get());
     }
 
     /** 스윕 결과를 한 표로 묶고 최적 동시성을 짚어준다. */
@@ -573,12 +617,13 @@ class HotAuctionLoadTest {
         }
         StringBuilder sb = new StringBuilder();
         sb.append(String.format("%n━━ 동시성 스윕 ━━ 구독자 %d(경매당) / 각 %d초 ━━%n", subscriberCount, durationSeconds));
-        sb.append(String.format("%-6s %-11s %9s %9s %8s %9s %9s %9s %9s %9s %9s%n",
-                "경매", "입찰자/경매", "성공/s", "전체req/s", "거절률", "응답p50", "응답p95", "전파p95", "(a)p95", "(b)p95", "pending"));
+        sb.append(String.format("%-6s %-11s %9s %9s %8s %9s %9s %9s %9s %9s %9s %10s %7s%n",
+                "경매", "입찰자/경매", "성공/s", "전체req/s", "거절률", "응답p50", "응답p95", "전파p95", "(a)p95", "(b)p95", "pending", "tomcat대기", "IO오류"));
         for (PhaseResult r : results) {
-            sb.append(String.format("%-6d %-11d %9.1f %9.1f %7.0f%% %8.1fms %8.1fms %8.1fms %8.1fms %8.1fms %9.1f%s%n",
+            sb.append(String.format("%-6d %-11d %9.1f %9.1f %7.0f%% %8.1fms %8.1fms %8.1fms %8.1fms %8.1fms %9.1f %10.1f %7d%s%n",
                     r.auctions(), r.bidders(), r.successPerSec(), r.requestsPerSec(), r.rejectRate() * 100,
                     r.respP50(), r.respP95(), r.propP95(), r.entryP95(), r.waitP95(), r.avgPending(),
+                    r.avgTomcatQueue(), r.ioErrors(),
                     r == best ? "  <- 최대" : ""));
         }
         sb.append(String.format("%n→ 최적 동시성: 경매 %d개 × 입찰자 %d명(경매당) 부근 (성공 합계 %.1f/s)%n",
@@ -629,7 +674,7 @@ class HotAuctionLoadTest {
                 default -> metrics.otherStatus.incrementAndGet();
             }
         } catch (Exception e) {
-            metrics.ioError.incrementAndGet();
+            metrics.recordIoError(e); // 개수 + 예외 유형별 집계(타임아웃/연결 거절 등 구분용)
         }
     }
 
@@ -669,9 +714,29 @@ class HotAuctionLoadTest {
         };
     }
 
-    private Thread startPoolSampler(HikariDataSource hikari) {
+    /**
+     * 100ms마다 Hikari 풀과 Tomcat 요청 스레드풀을 한 스레드에서 같이 샘플링한다.
+     * Tomcat은 busy(getActiveCount) / 큐 길이(getQueue().size() = 워커를 못 받아 대기 중인 요청)를 모은다.
+     * tomcatPool이 null이면(executor를 못 얻음) Tomcat 샘플은 건너뛴다.
+     */
+    private Thread startPoolSampler(HikariDataSource hikari, ThreadPoolExecutor tomcatPool) {
         Thread thread = new Thread(() -> {
             while (!Thread.currentThread().isInterrupted()) {
+                if (tomcatPool != null) {
+                    int busy = tomcatPool.getActiveCount();
+                    int queue = tomcatPool.getQueue().size();
+                    metrics.tomcatSamples.incrementAndGet();
+                    metrics.tomcatBusySum.addAndGet(busy);
+                    metrics.tomcatBusyMax.accumulateAndGet(busy, Math::max);
+                    metrics.tomcatQueueSum.addAndGet(queue);
+                    metrics.tomcatQueueMax.accumulateAndGet(queue, Math::max);
+                    if (busy >= tomcatPool.getMaximumPoolSize()) {
+                        metrics.tomcatSaturatedSamples.incrementAndGet();
+                    }
+                    if (queue > 0) {
+                        metrics.tomcatQueuedSamples.incrementAndGet();
+                    }
+                }
                 if (hikari != null) {
                     var mx = hikari.getHikariPoolMXBean();
                     int pending = mx.getThreadsAwaitingConnection();
@@ -706,6 +771,30 @@ class HotAuctionLoadTest {
         }
     }
 
+    /**
+     * 내장 Tomcat의 요청 처리 스레드풀을 꺼낸다.
+     * 경로: WebServerApplicationContext.getWebServer() → TomcatWebServer.getTomcat().getConnector()
+     *        .getProtocolHandler().getExecutor() → Tomcat 자체 ThreadPoolExecutor.
+     * [왜 JMX가 아닌가] 스프링 부트는 Tomcat MBean 레지스트리를 기본으로 꺼 둬서 JMX로는 안 보인다.
+     * 못 얻으면(다른 서버/타입 불일치) null을 돌려주고 리포트가 "읽을 수 없음"으로 표기한다 — unwrapHikari와 같은 패턴.
+     */
+    private ThreadPoolExecutor unwrapTomcatExecutor() {
+        try {
+            if (applicationContext instanceof WebServerApplicationContext webContext) {
+                WebServer server = webContext.getWebServer();
+                if (server instanceof TomcatWebServer tomcat) {
+                    Executor executor = tomcat.getTomcat().getConnector().getProtocolHandler().getExecutor();
+                    if (executor instanceof ThreadPoolExecutor pool) {
+                        return pool;
+                    }
+                }
+            }
+        } catch (Exception e) {
+            // 아래에서 null 반환
+        }
+        return null;
+    }
+
     private String databaseProduct() {
         try (Connection connection = dataSource.getConnection()) {
             return connection.getMetaData().getDatabaseProductName()
@@ -723,7 +812,7 @@ class HotAuctionLoadTest {
      * 한 경매의 상한(락 보유 1/p50)은 "경매당" 값이라 실제 처리량도 경매 평균으로 맞춰 비교한다.
      */
     private String buildReport(List<AuctionCheck> checks, long wallNanos, HikariDataSource hikari,
-                               int phaseAuctions, int phaseBidders, int totalSessions) {
+                               ThreadPoolExecutor tomcatPool, int phaseAuctions, int phaseBidders, int totalSessions) {
         double wallSeconds = wallNanos / 1_000_000_000.0;
 
         // 입찰 스레드 측정 — POST 보내고 답 받기까지
@@ -745,7 +834,13 @@ class HotAuctionLoadTest {
         double castP50 = metrics.broadcast.percentileMillis(0.50);
         double castP95 = metrics.broadcast.percentileMillis(0.95);
 
-        // 부하 생성기 몫: 입찰 스레드 응답 - 서버 처리. 같은 JVM이면 여기가 부풀어 오른다.
+        // [Tomcat 포화] busy가 maxThreads에 붙은 샘플 비율. 20%를 넘으면 요청이 필터 도달 전에 대기열에서 기다린 것.
+        //   이 대기는 ServerTimingFilter 밖이라 아래 "필터 밖" 몫에 섞여 들어간다.
+        double tomcatSatRatio = metrics.tomcatSamples.get() > 0
+                ? metrics.tomcatSaturatedSamples.get() / (double) metrics.tomcatSamples.get() : 0;
+        boolean tomcatSaturated = tomcatSatRatio > 0.20;
+
+        // 필터 밖 몫: 입찰 스레드 응답 - 서버(필터) 처리 = Tomcat 큐 대기 + 네트워크 + 부하 생성기 비용.
         double generatorP50 = Math.max(0, respP50 - srvP50);
         double generatorP95 = Math.max(0, respP95 - srvP95);
 
@@ -804,8 +899,14 @@ class HotAuctionLoadTest {
         sb.append(segment("  (b) 락 대기", waitP50, waitP95, srvP95));
         sb.append(segment("  (c) 트랜잭션", txP50, txP95, srvP95));
         sb.append(segment("  (d) broadcast", castP50, castP95, srvP95));
-        sb.append(String.format("  %-26s %6.1fms / %6.1fms   %s%n", "네트워크+부하 생성기", generatorP50, generatorP95,
-                generatorP95 > srvP95 ? "<- 부하 생성기가 같은 JVM. 서버 성능 아님" : ""));
+        String outsideNote = "";
+        if (generatorP95 > srvP95) {
+            outsideNote = tomcatSaturated
+                    ? "<- Tomcat 큐 대기(실제 서버 병목)가 부하 생성기 비용과 섞여 있음"
+                    : "<- 부하 생성기가 같은 JVM. 서버 성능 아님";
+        }
+        sb.append(String.format("  %-26s %6.1fms / %6.1fms   %s%n", "필터 밖 (Tomcat 대기+네트워크+생성기)",
+                generatorP50, generatorP95, outsideNote));
         sb.append(String.format("  %-26s %6.1fms / %6.1fms%n", "(f) 팬아웃", fanP50, fanP95));
 
         sb.append(String.format("%n[락]%n"));
@@ -832,6 +933,8 @@ class HotAuctionLoadTest {
 
         sb.append(String.format("%n[DB]%n"));
         sb.append(poolSection(hikari));
+        sb.append(String.format("%n[Tomcat]%n"));
+        sb.append(tomcatSection(tomcatPool));
 
         sb.append(String.format("%n[결과 분포]%n"));
         sb.append(String.format("  201                %,6d   (성공)%n", created));
@@ -844,6 +947,13 @@ class HotAuctionLoadTest {
         if (metrics.otherStatus.get() > 0 || metrics.ioError.get() > 0) {
             sb.append(String.format("  기타/IO오류        %,6d / %,6d%n",
                     metrics.otherStatus.get(), metrics.ioError.get()));
+        }
+        if (metrics.ioError.get() > 0) {
+            sb.append(String.format("  IO오류 유형별 (개수 내림차순):%n"));
+            metrics.ioErrorByType.entrySet().stream()
+                    .sorted((x, y) -> y.getValue().get() - x.getValue().get())
+                    .forEach(en -> sb.append(String.format("    %,6d  %s   예: %s%n",
+                            en.getValue().get(), en.getKey(), metrics.ioErrorSample.get(en.getKey()))));
         }
 
         // 경매별 성공/s: 처리량이 경매 사이에 고르게 나뉘는지 본다. (min/max 비율이 1에 가까울수록 고름)
@@ -868,7 +978,7 @@ class HotAuctionLoadTest {
         }
 
         sb.append(String.format("%n[판정 힌트] %s%n",
-                verdict(entryP95, waitP95, txP95, castP95, srvP95, generatorP95, holdP95)));
+                verdict(entryP95, waitP95, txP95, castP95, srvP95, generatorP95, holdP95, tomcatSaturated)));
         return sb.toString();
     }
 
@@ -912,13 +1022,53 @@ class HotAuctionLoadTest {
     }
 
     /**
+     * Tomcat 요청 스레드풀 상태. busy = 요청을 처리 중인 워커, queue = 워커를 못 받아 대기 중인 요청.
+     * Hikari와 같은 이유로 최대값이 아니라 평균과 "포화/대기가 있었던 시간 비율"로 지속성을 판단한다.
+     */
+    private String tomcatSection(ThreadPoolExecutor pool) {
+        int n = metrics.tomcatSamples.get();
+        if (pool == null || n == 0) {
+            return "  (Tomcat 스레드풀 정보를 읽을 수 없음)\n";
+        }
+        int max = pool.getMaximumPoolSize();
+        double avgBusy = metrics.tomcatBusySum.get() / (double) n;
+        double avgQueue = metrics.tomcatQueueSum.get() / (double) n;
+        double satRatio = metrics.tomcatSaturatedSamples.get() / (double) n;
+        double queuedRatio = metrics.tomcatQueuedSamples.get() / (double) n;
+
+        String judgement;
+        if (satRatio > 0.20) {
+            judgement = "Tomcat 스레드 포화 — 요청이 필터 도달 전에 대기열에서 기다림. 이 대기는 '필터 밖' 시간에 포함됨";
+        } else if (metrics.tomcatQueueMax.get() > 0) {
+            judgement = String.format("순간 스파이크만(대기열 발생 구간 %.1f%%) — 정상 구간은 여유", queuedRatio * 100);
+        } else {
+            judgement = "여유";
+        }
+
+        StringBuilder sb = new StringBuilder();
+        sb.append(String.format("  busy     평균 %.1f / 최대 %d   (최대 스레드 %d, 사용률 %.0f%%)%n",
+                avgBusy, metrics.tomcatBusyMax.get(), max, avgBusy / max * 100));
+        sb.append(String.format("  queue    평균 %.1f / 최대 %d%n", avgQueue, metrics.tomcatQueueMax.get()));
+        sb.append(String.format("  포화 구간 %.1f%% (busy == 최대)   대기열 발생 구간 %.1f%%%n",
+                satRatio * 100, queuedRatio * 100));
+        sb.append(String.format("  판정: %s%n", judgement));
+        return sb.toString();
+    }
+
+    /**
      * 어디가 병목인지 한 줄로 요약한다.
      * 서버 내부 구간끼리만 비교하고, 부하 생성기 비용이 서버보다 크면 그 사실을 먼저 알린다.
      */
     private String verdict(double entry, double wait, double tx, double cast,
-                           double server, double generator, double hold) {
+                           double server, double generator, double hold, boolean tomcatSaturated) {
         if (server == 0) {
             return "샘플 부족 — 지속 시간을 늘리거나 입찰자를 늘려볼 것";
+        }
+        if (generator > server && tomcatSaturated) {
+            return String.format(
+                    "필터 밖 시간(%.1fms)이 서버 처리(%.1fms)보다 큼 + Tomcat 스레드 포화 — 요청이 필터 도달 전 Tomcat 큐에서 대기한 "
+                            + "실제 서버 병목이 부하 생성기 비용과 섞여 있다. server.tomcat.threads.max와 입찰 스레드 수를 함께 볼 것",
+                    generator, server);
         }
         if (generator > server) {
             return String.format(
