@@ -14,6 +14,8 @@ import com.example.yanpaMarket_backend.global.error.ApiException;
 import com.example.yanpaMarket_backend.global.error.ErrorCode;
 import com.example.yanpaMarket_backend.user.domain.User;
 import com.example.yanpaMarket_backend.user.repository.UserRepository;
+import com.example.yanpaMarket_backend.user.service.UserLookupService;
+import com.example.yanpaMarket_backend.user.service.UserSummary;
 import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.HashSet;
@@ -56,6 +58,8 @@ public class BidService {
     private final BidRepository bidRepository;
     private final AuctionRepository auctionRepository;
     private final UserRepository userRepository;
+    // [캐시된 사용자 조회] placeBid의 락 밖 사용자 조회 전용. CacheConfig / UserLookupService 참고.
+    private final UserLookupService userLookupService;
     private final BidLock bidLock;
     private final SimpMessagingTemplate messagingTemplate;
     // [주입] TransactionTemplate은 Spring Boot가 자동 등록해주는 빈이다.
@@ -74,7 +78,11 @@ public class BidService {
         // 락 밖에서 식별자 해석(읽기 전용)
         // [왜 락 밖인가] 임계구역을 최대한 짧게 유지하기 위해. 여기 값들은 경합 대상이 아니다
         //   (사용자 PK/경매 PK는 변하지 않고, 닉네임 마스킹은 단순 문자열 조작).
-        User bidder = userRepository.findByPublicId(bidderPublicId)
+        // [왜 캐시를 거치나] 이 두 조회는 거절될 입찰(부하 테스트에서 요청의 92%)까지 포함해 매 요청 실행됐고,
+        //   조회마다 DB 커넥션을 따로 빌려 커넥션 풀 고갈의 주원인이 됐다(인기 경매 3건 구간, 서버 처리의 87%).
+        //   두 값 모두 바뀌지 않거나 거의 안 바뀌어 서버 메모리에 캐시한다 → 요청당 커넥션 획득 3번 → 1번.
+        //   정확성은 여전히 락 안의 findById 재조회와 도메인 검증이 지킨다. 캐시는 속도만 담당한다.
+        UserSummary bidder = userLookupService.findSummaryByPublicId(bidderPublicId)
                 .orElseThrow(() -> new ApiException(ErrorCode.UNAUTHORIZED, "사용자를 찾을 수 없습니다."));
         // [ID 프로젝션을 쓰는 이유] 엔티티가 아니라 내부 PK만 가져온다.
         //   락 밖에서 읽은 경매는 이미 낡은 데이터(stale)다 — 이 줄과 락 획득 사이에
@@ -84,10 +92,11 @@ public class BidService {
         //   엔티티로 받으면 그 낡은 인스턴스가 영속성 컨텍스트에 남아, OSIV가 켜질 경우
         //   락 안의 findById가 1차 캐시에서 그걸 그대로 돌려줘 "재조회"가 무의미해진다.
         //   ID만 받으면 애초에 컨텍스트에 안 들어가므로 OSIV 설정과 무관하게 안전하다.
+        //   (이 조회는 AuctionRepository에서 @Cacheable로 캐시된다)
         Long auctionId = auctionRepository.findIdByPublicId(auctionPublicId)
                 .orElseThrow(() -> new ApiException(ErrorCode.AUCTION_NOT_FOUND));
         long amount = request.amount();
-        String maskedBidder = NicknameMasker.mask(bidder.getNickname());
+        String maskedBidder = NicknameMasker.mask(bidder.nickname());
 
         // 락 안에서 [트랜잭션 실행 → 커밋 → broadcast] 까지 처리한다.
         PlacedBid placed;
@@ -95,7 +104,7 @@ public class BidService {
             placed = bidLock.executeWithLock(auctionId, () -> {
                 // transactionTemplate.execute()는 커밋까지 끝내고 반환한다. 그 호출이 락 람다 안에 있으므로
                 // 커밋이 락 안에서 일어나고, 다음 스레드는 반드시 반영된 상태를 읽는다.
-                PlacedBid p = transactionTemplate.execute(status -> doPlaceBid(auctionId, bidder.getId(), amount));
+                PlacedBid p = transactionTemplate.execute(status -> doPlaceBid(auctionId, bidder.id(), amount));
 
                 // [커밋 후에만 broadcast] 별도 조건문이 없다. 검증 실패로 롤백되거나 @Version 충돌이 나면
                 //   예외가 위로 전파되어 이 줄에 애초에 도달하지 않는다.
