@@ -12,6 +12,7 @@ import com.example.yanpaMarket_backend.user.domain.UserStatus;
 import com.example.yanpaMarket_backend.user.repository.UserRepository;
 import com.example.yanpaMarket_backend.user.service.UserLookupService;
 import com.example.yanpaMarket_backend.user.service.UserSummary;
+import com.github.benmanes.caffeine.cache.stats.CacheStats;
 import java.time.LocalDateTime;
 import java.util.Optional;
 import org.junit.jupiter.api.BeforeEach;
@@ -20,6 +21,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.cache.Cache;
 import org.springframework.cache.CacheManager;
+import org.springframework.cache.caffeine.CaffeineCache;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -96,6 +98,22 @@ class LookupCacheTest {
 
         assertThat(found).isEmpty();
         assertThat(userSummaryCache.get(unknown)).isNull();
+    }
+
+    @Test
+    void 캐시_통계가_기록된다() {
+        // [무엇] 사용자 요약 캐시가 적중/미스 횟수를 기록하는지 확인한다 (부하 테스트 [캐시] 리포트의 근거).
+        // [왜] 통계는 Spring 컨텍스트가 공유되는 동안 누적되므로, 호출 전후 스냅샷의 차이(minus)로 이 테스트 몫만 본다.
+        User user = userRepository.saveAndFlush(user("cache-stats@y.com", "통계왕", "010-8000-0003"));
+        CaffeineCache caffeine = (CaffeineCache) userSummaryCache;
+        CacheStats before = caffeine.getNativeCache().stats();
+
+        userLookupService.findSummaryByPublicId(user.getPublicId()); // 첫 조회: 미스
+        userLookupService.findSummaryByPublicId(user.getPublicId()); // 두 번째 조회: 적중
+
+        CacheStats delta = caffeine.getNativeCache().stats().minus(before);
+        assertThat(delta.missCount()).isEqualTo(1);
+        assertThat(delta.hitCount()).isEqualTo(1);
     }
 
     private Auction auction(Long sellerId) {

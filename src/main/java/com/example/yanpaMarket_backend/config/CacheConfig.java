@@ -29,6 +29,8 @@ import org.springframework.context.annotation.Configuration;
  *          @CacheEvict(cacheNames = CacheNames.USER_SUMMARY_BY_PUBLIC_ID, key = "<publicId>")를 붙일 것.
  *          10분 만료는 그걸 빠뜨렸을 때의 안전장치일 뿐이다.
  *
+ * [통계] 위 두 캐시는 recordStats()로 적중/미스 횟수를 기록한다(부하 테스트 [캐시] 리포트용).
+ *
  * [등록 안 된 이름] setCaffeine의 기본 정책(최대 1천 건, 10분)이 적용된다.
  *   이름 오타로 새 캐시가 생겨도 무한히 커지지 않게 하려는 방어선이다.
  */
@@ -46,11 +48,15 @@ public class CacheConfig {
         manager.registerCustomCache(CacheNames.AUCTION_ID_BY_PUBLIC_ID, Caffeine.newBuilder()
                 .maximumSize(10_000)
                 .expireAfterAccess(Duration.ofHours(1))
+                // 적중/미스 횟수 기록 — 부하 테스트 리포트의 [캐시] 섹션에서 읽는다. 비용은 조회마다 카운터 증가 수준.
+                .recordStats()
                 .build());
 
         manager.registerCustomCache(CacheNames.USER_SUMMARY_BY_PUBLIC_ID, Caffeine.newBuilder()
                 .maximumSize(10_000)
                 .expireAfterWrite(Duration.ofMinutes(10))
+                // 적중/미스 횟수 기록 — 부하 테스트 리포트의 [캐시] 섹션에서 읽는다. 비용은 조회마다 카운터 증가 수준.
+                .recordStats()
                 .build());
 
         return manager;

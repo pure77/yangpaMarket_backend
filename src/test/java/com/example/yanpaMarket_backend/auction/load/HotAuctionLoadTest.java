@@ -17,13 +17,18 @@ import com.example.yanpaMarket_backend.security.JwtProvider;
 import com.example.yanpaMarket_backend.user.domain.User;
 import com.example.yanpaMarket_backend.user.domain.UserStatus;
 import com.example.yanpaMarket_backend.user.repository.UserRepository;
+import com.example.yanpaMarket_backend.common.cache.CacheNames;
 import com.fasterxml.jackson.databind.JsonNode;
+import com.github.benmanes.caffeine.cache.stats.CacheStats;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.zaxxer.hikari.HikariDataSource;
 import org.apache.tomcat.util.threads.ThreadPoolExecutor;
 import org.springframework.boot.tomcat.TomcatWebServer;
 import org.springframework.boot.web.server.WebServer;
 import org.springframework.boot.web.server.context.WebServerApplicationContext;
+import org.springframework.cache.Cache;
+import org.springframework.cache.CacheManager;
+import org.springframework.cache.caffeine.CaffeineCache;
 import org.springframework.context.ApplicationContext;
 import java.lang.reflect.Type;
 import java.net.URI;
@@ -89,6 +94,7 @@ import org.springframework.web.socket.sockjs.client.WebSocketTransport;
  *   ./gradlew.bat test --tests '*HotAuctionLoadTest*' -Dloadtest=true
  *   파라미터: -Dload.subscribers=100 -Dload.bidders=20 -Dload.seconds=60 -Dload.thinkMillis=100
  *   리포트: 콘솔 + build/reports/load/hot-auction-{시각}-auctions{K}-bidders{N}.txt
+ *   리포트의 [캐시] 섹션: 구간 동안의 경매 ID/사용자 요약 캐시 조회 수·적중률·미스 수(구간 시작 대비 증가분).
  *
  * [여러 인기 경매 동시 시뮬레이션 — 경매 수 파라미터]
  *   -Dload.auctions=3            인기 경매 3건에 동시에 입찰이 몰린다(기본 1 = 예전과 동일).
@@ -211,6 +217,8 @@ class HotAuctionLoadTest {
     @Autowired JwtProvider jwtProvider;
     @Autowired DataSource dataSource;
     @Autowired LoadMetrics metrics;
+    // 구간별 캐시 적중률([캐시] 섹션)을 읽기 위한 캐시 관리자
+    @Autowired CacheManager cacheManager;
     // Tomcat 요청 스레드풀을 꺼내기 위한 컨텍스트(WebServerApplicationContext로 내장 서버를 얻는다)
     @Autowired ApplicationContext applicationContext;
 
@@ -358,7 +366,29 @@ class HotAuctionLoadTest {
     record PhaseResult(int auctions, int bidders, double successPerSec, double requestsPerSec, double rejectRate,
                        double respP50, double respP95, double propP95,
                        double entryP95, double waitP95, double avgPending,
-                       double avgTomcatQueue, int ioErrors) {
+                       double avgTomcatQueue, int ioErrors, double userCacheHitRate) {
+    }
+
+    /**
+     * 구간 하나 동안의 캐시 통계 증가분(구간 끝 - 구간 시작). 읽을 수 없는 캐시는 null.
+     * [왜 증가분인가] Caffeine 통계는 컨텍스트 수명 동안 누적되어, 앞 구간의 적중/미스가 섞이면 구간별 비교가 안 된다.
+     */
+    record CacheDeltas(CacheStats auctionId, CacheStats userSummary) {
+    }
+
+    /** 이름으로 캐시를 찾아 Caffeine 원본 통계를 돌려준다. Caffeine이 아니거나 없으면 null(리포트에 "읽을 수 없음"). */
+    private CacheStats cacheStats(String cacheName) {
+        Cache cache = cacheManager.getCache(cacheName);
+        if (cache instanceof CaffeineCache caffeine) {
+            return caffeine.getNativeCache().stats();
+        }
+        return null;
+    }
+
+    /** 구간 시작 스냅샷과 지금 통계의 차이. 어느 쪽이든 못 읽으면 null. */
+    private CacheStats cacheDelta(CacheStats before, String cacheName) {
+        CacheStats after = cacheStats(cacheName);
+        return before == null || after == null ? null : after.minus(before);
     }
 
     /** 경매 한 건의 정합성 점검 재료. bidCount 증가분 == 그 경매의 201 응답 수여야 한다. */
@@ -463,6 +493,9 @@ class HotAuctionLoadTest {
                 List<String> activeIds = auctionIds.subList(0, phaseAuctions);
 
                 metrics.reset();                   // 구간마다 통계를 새로 모은다
+                // 캐시 통계는 컨텍스트 수명 동안 누적되므로, 구간 시작 시점을 찍어 두고 끝나면 차이만 쓴다.
+                CacheStats auctionCacheBefore = cacheStats(CacheNames.AUCTION_ID_BY_PUBLIC_ID);
+                CacheStats userCacheBefore = cacheStats(CacheNames.USER_SUMMARY_BY_PUBLIC_ID);
                 Map<String, Integer> bidCountBefore = new LinkedHashMap<>();
                 for (String id : activeIds) {
                     bidCountBefore.put(id, auctionRepository.findByPublicId(id).orElseThrow().getBidCount());
@@ -485,6 +518,9 @@ class HotAuctionLoadTest {
                 ThreadPoolExecutor tomcatPool = unwrapTomcatExecutor();
                 Thread poolSampler = startPoolSampler(hikari, tomcatPool);
                 long wallNanos = runBiddingPhase(activeIds, tokensByAuction, phaseBidders);
+                CacheDeltas cacheDeltas = new CacheDeltas(
+                        cacheDelta(auctionCacheBefore, CacheNames.AUCTION_ID_BY_PUBLIC_ID),
+                        cacheDelta(userCacheBefore, CacheNames.USER_SUMMARY_BY_PUBLIC_ID));
                 Thread.sleep(1000);                // 마지막 메시지들이 도착할 시간
                 poolSampler.interrupt();
 
@@ -502,10 +538,10 @@ class HotAuctionLoadTest {
                             success == null ? 0 : success.get(), persistedBids));
                 }
 
-                String report = buildReport(checks, wallNanos, hikari, tomcatPool, phaseAuctions, phaseBidders, sessions.size());
+                String report = buildReport(checks, wallNanos, hikari, tomcatPool, phaseAuctions, phaseBidders, sessions.size(), cacheDeltas);
                 System.out.println(report);
                 writeReport(report, "auctions" + phaseAuctions + "-bidders" + phaseBidders);
-                results.add(snapshot(phaseAuctions, phaseBidders, wallNanos));
+                results.add(snapshot(phaseAuctions, phaseBidders, wallNanos, cacheDeltas));
             }
         }
 
@@ -585,7 +621,7 @@ class HotAuctionLoadTest {
         return System.nanoTime() - wallStart;
     }
 
-    private PhaseResult snapshot(int auctions, int bidders, long wallNanos) {
+    private PhaseResult snapshot(int auctions, int bidders, long wallNanos, CacheDeltas cacheDeltas) {
         double wallSeconds = wallNanos / 1_000_000_000.0;
         int created = metrics.created201.get();
         long total = created + metrics.tooLow400.get() + metrics.conflict409.get() + metrics.serverError500.get();
@@ -604,7 +640,10 @@ class HotAuctionLoadTest {
                 n > 0 ? metrics.poolPendingSum.get() / (double) n : 0,
                 metrics.tomcatSamples.get() > 0
                         ? metrics.tomcatQueueSum.get() / (double) metrics.tomcatSamples.get() : 0,
-                metrics.ioError.get());
+                metrics.ioError.get(),
+                // 조회가 0건이거나 못 읽으면 -1 → 표에서 "-"로 찍는다
+                cacheDeltas.userSummary() != null && cacheDeltas.userSummary().requestCount() > 0
+                        ? cacheDeltas.userSummary().hitRate() * 100 : -1);
     }
 
     /** 스윕 결과를 한 표로 묶고 최적 동시성을 짚어준다. */
@@ -617,13 +656,15 @@ class HotAuctionLoadTest {
         }
         StringBuilder sb = new StringBuilder();
         sb.append(String.format("%n━━ 동시성 스윕 ━━ 구독자 %d(경매당) / 각 %d초 ━━%n", subscriberCount, durationSeconds));
-        sb.append(String.format("%-6s %-11s %9s %9s %8s %9s %9s %9s %9s %9s %9s %10s %7s%n",
-                "경매", "입찰자/경매", "성공/s", "전체req/s", "거절률", "응답p50", "응답p95", "전파p95", "(a)p95", "(b)p95", "pending", "tomcat대기", "IO오류"));
+        sb.append(String.format("%-6s %-11s %9s %9s %8s %9s %9s %9s %9s %9s %9s %10s %7s %14s%n",
+                "경매", "입찰자/경매", "성공/s", "전체req/s", "거절률", "응답p50", "응답p95", "전파p95", "(a)p95", "(b)p95", "pending", "tomcat대기", "IO오류",
+                "사용자캐시적중"));
         for (PhaseResult r : results) {
-            sb.append(String.format("%-6d %-11d %9.1f %9.1f %7.0f%% %8.1fms %8.1fms %8.1fms %8.1fms %8.1fms %9.1f %10.1f %7d%s%n",
+            String userHit = r.userCacheHitRate() < 0 ? "-" : String.format("%.2f%%", r.userCacheHitRate());
+            sb.append(String.format("%-6d %-11d %9.1f %9.1f %7.0f%% %8.1fms %8.1fms %8.1fms %8.1fms %8.1fms %9.1f %10.1f %7d %14s%s%n",
                     r.auctions(), r.bidders(), r.successPerSec(), r.requestsPerSec(), r.rejectRate() * 100,
                     r.respP50(), r.respP95(), r.propP95(), r.entryP95(), r.waitP95(), r.avgPending(),
-                    r.avgTomcatQueue(), r.ioErrors(),
+                    r.avgTomcatQueue(), r.ioErrors(), userHit,
                     r == best ? "  <- 최대" : ""));
         }
         sb.append(String.format("%n→ 최적 동시성: 경매 %d개 × 입찰자 %d명(경매당) 부근 (성공 합계 %.1f/s)%n",
@@ -807,12 +848,29 @@ class HotAuctionLoadTest {
     // ── 리포트 ──────────────────────────────────────────────────────────────────
 
     /**
+     * [캐시] 섹션. 읽는 법: 미스는 이 구간에서 처음 보는 경매/입찰자 수와 비슷해야 정상이다.
+     * 적중률이 그보다 훨씬 낮으면 캐시가 우회되고 있다는 뜻(키 불일치, 프록시 밖 호출 등).
+     */
+    private String cacheSection(CacheDeltas deltas) {
+        return cacheLine("경매 ID    ", deltas.auctionId()) + cacheLine("사용자 요약", deltas.userSummary());
+    }
+
+    private String cacheLine(String label, CacheStats stats) {
+        if (stats == null) {
+            return String.format("  %s (캐시 통계를 읽을 수 없음)%n", label);
+        }
+        String hit = stats.requestCount() == 0 ? "-" : String.format("%.2f%%", stats.hitRate() * 100);
+        return String.format("  %s  조회 %,d회   적중 %s   미스 %,d회%n", label, stats.requestCount(), hit, stats.missCount());
+    }
+
+    /**
      * 구간 리포트. 지연/풀 지표는 구간 전체(모든 활성 경매)를 합친 값이고,
      * 처리량·정합성은 경매별로 따로 보여준다(경매 간 몫이 고른지 확인하려고).
      * 한 경매의 상한(락 보유 1/p50)은 "경매당" 값이라 실제 처리량도 경매 평균으로 맞춰 비교한다.
      */
     private String buildReport(List<AuctionCheck> checks, long wallNanos, HikariDataSource hikari,
-                               ThreadPoolExecutor tomcatPool, int phaseAuctions, int phaseBidders, int totalSessions) {
+                               ThreadPoolExecutor tomcatPool, int phaseAuctions, int phaseBidders, int totalSessions,
+                               CacheDeltas cacheDeltas) {
         double wallSeconds = wallNanos / 1_000_000_000.0;
 
         // 입찰 스레드 측정 — POST 보내고 답 받기까지
@@ -933,6 +991,8 @@ class HotAuctionLoadTest {
 
         sb.append(String.format("%n[DB]%n"));
         sb.append(poolSection(hikari));
+        sb.append(String.format("%n[캐시]%n"));
+        sb.append(cacheSection(cacheDeltas));
         sb.append(String.format("%n[Tomcat]%n"));
         sb.append(tomcatSection(tomcatPool));
 
