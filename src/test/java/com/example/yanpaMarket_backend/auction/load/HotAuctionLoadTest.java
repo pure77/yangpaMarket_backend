@@ -17,9 +17,19 @@ import com.example.yanpaMarket_backend.security.JwtProvider;
 import com.example.yanpaMarket_backend.user.domain.User;
 import com.example.yanpaMarket_backend.user.domain.UserStatus;
 import com.example.yanpaMarket_backend.user.repository.UserRepository;
+import com.example.yanpaMarket_backend.common.cache.CacheNames;
 import com.fasterxml.jackson.databind.JsonNode;
+import com.github.benmanes.caffeine.cache.stats.CacheStats;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.zaxxer.hikari.HikariDataSource;
+import org.apache.tomcat.util.threads.ThreadPoolExecutor;
+import org.springframework.boot.tomcat.TomcatWebServer;
+import org.springframework.boot.web.server.WebServer;
+import org.springframework.boot.web.server.context.WebServerApplicationContext;
+import org.springframework.cache.Cache;
+import org.springframework.cache.CacheManager;
+import org.springframework.cache.caffeine.CaffeineCache;
+import org.springframework.context.ApplicationContext;
 import java.lang.reflect.Type;
 import java.net.URI;
 import java.net.http.HttpClient;
@@ -32,10 +42,13 @@ import java.time.Duration;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executor;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
@@ -80,7 +93,26 @@ import org.springframework.web.socket.sockjs.client.WebSocketTransport;
  * [실행 방법] 평소 ./gradlew test 에서는 건너뛴다(수십 초 걸림).
  *   ./gradlew.bat test --tests '*HotAuctionLoadTest*' -Dloadtest=true
  *   파라미터: -Dload.subscribers=100 -Dload.bidders=20 -Dload.seconds=60 -Dload.thinkMillis=100
- *   리포트: 콘솔 + build/reports/load/hot-auction-{시각}.txt
+ *   리포트: 콘솔 + build/reports/load/hot-auction-{시각}-auctions{K}-bidders{N}.txt
+ *   리포트의 [캐시] 섹션: 구간 동안의 경매 ID/사용자 요약 캐시 조회 수·적중률·미스 수(구간 시작 대비 증가분).
+ *
+ * [여러 인기 경매 동시 시뮬레이션 — 경매 수 파라미터]
+ *   -Dload.auctions=3            인기 경매 3건에 동시에 입찰이 몰린다(기본 1 = 예전과 동일).
+ *   -Dload.auctionSweep=1,3,5    경매 수를 바꿔가며 구간(phase)을 순차 측정한다. 없으면 load.auctions 하나.
+ *   [주의] load.bidders / load.subscribers 는 "경매당" 값이다.
+ *     예) auctions=5, bidders=100, subscribers=100 → 입찰 스레드 500개, STOMP 세션 500개.
+ *   구간 = 경매 수(바깥 루프) × 입찰자 수(안쪽 루프, load.sweep 또는 load.bidders)의 곱집합.
+ *   예) ./gradlew.bat test --tests '*HotAuctionLoadTest*' -Dloadtest=true \
+ *         -Dload.auctionSweep=1,3,5 -Dload.bidders=100 -Dload.subscribers=100
+ *
+ * [여러 경매를 어떻게 돌리나]
+ *   - 경매는 최대 경매 수만큼 미리 만들고, k개짜리 구간은 앞의 k개에만 입찰한다.
+ *   - 입찰 계정은 (최대 경매 수 × 최대 입찰자 수)명을 미리 만들고, 입찰 스레드 하나는 경매 하나에만
+ *     묶인다(경매마다 서로 겹치지 않는 토큰 묶음).
+ *   - 구독자는 구간 시작에 "활성 경매마다" subscribers 개씩 붙이고 구간이 끝나면 끊는다.
+ *     놀고 있는 경매의 세션이 구간 수치에 섞이지 않게 하기 위해서다.
+ *   - 현재가(latestPrice)는 경매별이고 구간이 바뀌어도 이어진다. 전파 지연 상관용 키도
+ *     "publicId:금액"이라 금액이 같은 두 경매가 서로의 지연을 가로채지 않는다.
  *
  * [측정 분해 — 전부 "요청별"로 확정한다]
  *   POST 전송 ─┐  ← 입찰 스레드 시작
@@ -169,8 +201,12 @@ class HotAuctionLoadTest {
     /** 최소 입찰 인상폭. Auction 생성자의 minimumBidIncrement와 같아야 한다. */
     private static final long INCREMENT = 10_000L;
 
+    /** 경매당 구독자 수. 총 세션 = 활성 경매 수 × 이 값. */
     private final int subscriberCount = Integer.getInteger("load.subscribers", 100);
+    /** 경매당 입찰자 수. 총 입찰 스레드 = 활성 경매 수 × 이 값. */
     private final int bidderCount = Integer.getInteger("load.bidders", 20);
+    /** 인기 경매 수(-Dload.auctionSweep가 없을 때의 단일 구간 값). */
+    private final int auctionCount = Integer.getInteger("load.auctions", 1);
     private final int durationSeconds = Integer.getInteger("load.seconds", 60);
     private final int thinkMillis = Integer.getInteger("load.thinkMillis", 100);
 
@@ -181,6 +217,10 @@ class HotAuctionLoadTest {
     @Autowired JwtProvider jwtProvider;
     @Autowired DataSource dataSource;
     @Autowired LoadMetrics metrics;
+    // 구간별 캐시 적중률([캐시] 섹션)을 읽기 위한 캐시 관리자
+    @Autowired CacheManager cacheManager;
+    // Tomcat 요청 스레드풀을 꺼내기 위한 컨텍스트(WebServerApplicationContext로 내장 서버를 얻는다)
+    @Autowired ApplicationContext applicationContext;
 
     // broadcast 소요 시간과 "발행 시각"을 얻기 위해 spy로 감싼다. 실제 전송은 그대로 수행된다.
     @MockitoSpyBean SimpMessagingTemplate messagingTemplate;
@@ -241,9 +281,16 @@ class HotAuctionLoadTest {
         final LoadSamples propagation = new LoadSamples();     // POST 전송 → 구독자 수신
         final LoadSamples fanout = new LoadSamples();          // (f) 발행 → 구독자 수신
 
-        /** 금액을 키로 "보낸 시각"과 "발행 시각"을 공유한다 — 크로스 프로토콜 상관용. */
-        final ConcurrentHashMap<Long, Long> sentAtByPrice = new ConcurrentHashMap<>();
-        final ConcurrentHashMap<Long, Long> publishedAtByPrice = new ConcurrentHashMap<>();
+        /**
+         * "publicId:금액"을 키로 "보낸 시각"과 "발행 시각"을 공유한다 — 크로스 프로토콜 상관용.
+         * [왜 금액만으로는 안 되나] 경매가 여럿이면 서로 다른 경매가 같은 금액을 가질 수 있어
+         * 전파 지연이 엉뚱한 경매의 전송 시각과 짝지어진다. 경매 id를 키에 포함해 막는다.
+         */
+        final ConcurrentHashMap<String, Long> sentAtByPrice = new ConcurrentHashMap<>();
+        final ConcurrentHashMap<String, Long> publishedAtByPrice = new ConcurrentHashMap<>();
+
+        /** 경매별 성공(201) 횟수. 구간마다 reset()에서 비우고, 값은 필요할 때 만든다. */
+        final ConcurrentHashMap<String, AtomicInteger> successByAuction = new ConcurrentHashMap<>();
 
         final AtomicInteger created201 = new AtomicInteger();
         final AtomicInteger tooLow400 = new AtomicInteger();
@@ -252,8 +299,11 @@ class HotAuctionLoadTest {
         final AtomicInteger otherStatus = new AtomicInteger();
         final AtomicInteger ioError = new AtomicInteger();
 
-        /** 입찰자들이 "현재 화면에 보이는 현재가"로 삼는 값. 구독 메시지와 성공 응답으로 갱신된다. */
-        final AtomicLong latestPrice = new AtomicLong();
+        /**
+         * 경매(publicId)별로 입찰자들이 "현재 화면에 보이는 현재가"로 삼는 값.
+         * 그 경매의 구독 메시지(BID_UPDATE)와 성공 응답으로만 갱신된다. 다른 경매에 영향 없음.
+         */
+        final ConcurrentHashMap<String, AtomicLong> latestPrice = new ConcurrentHashMap<>();
 
         // Hikari 풀 샘플링
         // [왜 평균과 "대기 발생 비율"까지 세나] 최대값 하나로 판단하면 시작 순간 스파이크 한 번에
@@ -267,23 +317,82 @@ class HotAuctionLoadTest {
         final AtomicInteger poolActiveMax = new AtomicInteger();
         final AtomicInteger poolPendingSamples = new AtomicInteger(); // pending>0 이었던 샘플 수
 
+        // [IO 오류 유형별 집계] 예전엔 catch에서 개수만 세고 예외 종류를 버렸다. 타임아웃(대기열 적체)인지
+        //   연결 거절/리셋(accept 큐 초과)인지 구분이 안 돼서, 유형(+원인) 이름을 키로 개수와 첫 메시지를 모은다.
+        final ConcurrentHashMap<String, AtomicInteger> ioErrorByType = new ConcurrentHashMap<>();
+        final ConcurrentHashMap<String, String> ioErrorSample = new ConcurrentHashMap<>();
+
+        /** 예외 하나를 유형별로 기록한다. 키 = "클래스" 또는 "클래스 ← 원인클래스", 샘플은 유형당 첫 메시지(150자). */
+        void recordIoError(Exception e) {
+            ioError.incrementAndGet();
+            String key = e.getClass().getSimpleName();
+            if (e.getCause() != null) {
+                key += " ← " + e.getCause().getClass().getSimpleName();
+            }
+            ioErrorByType.computeIfAbsent(key, k -> new AtomicInteger()).incrementAndGet();
+            String message = String.valueOf(e.getMessage());
+            ioErrorSample.putIfAbsent(key, message.length() > 150 ? message.substring(0, 150) + "…" : message);
+        }
+
+        // Tomcat 요청 스레드풀 샘플링 (Hikari 샘플러와 같은 스레드가 100ms마다 채운다)
+        // [왜 재나] 입찰 스레드가 maxThreads(기본 200)보다 많으면 요청이 필터에 닿기 전에 Tomcat 큐에서 기다린다.
+        //   이 대기는 ServerTimingFilter 밖이라 "필터 밖" 시간에 섞여 들어간다 — 실제 서버 대기인데 생성기 비용으로 오해되기 쉽다.
+        final AtomicInteger tomcatSamples = new AtomicInteger();
+        final AtomicLong tomcatBusySum = new AtomicLong();
+        final AtomicInteger tomcatBusyMax = new AtomicInteger();
+        final AtomicLong tomcatQueueSum = new AtomicLong();
+        final AtomicInteger tomcatQueueMax = new AtomicInteger();
+        final AtomicInteger tomcatSaturatedSamples = new AtomicInteger(); // busy >= maxThreads 였던 샘플 수
+        final AtomicInteger tomcatQueuedSamples = new AtomicInteger();    // queue > 0 이었던 샘플 수
+
         /** 스윕 모드에서 구간마다 처음부터 다시 재기 위해 전부 비운다. latestPrice는 경매가 이어지므로 남긴다. */
         void reset() {
             serverHandling.reset(); entry.reset(); lockWait.reset(); lockHold.reset();
             transaction.reset(); broadcast.reset(); responseTime.reset(); propagation.reset(); fanout.reset();
             lockHoldSuccess.reset(); transactionSuccess.reset();
             sentAtByPrice.clear(); publishedAtByPrice.clear();
+            successByAuction.clear();
             created201.set(0); tooLow400.set(0); conflict409.set(0);
             serverError500.set(0); otherStatus.set(0); ioError.set(0);
             poolSamples.set(0); poolActiveSum.set(0); poolIdleSum.set(0); poolPendingSum.set(0);
             poolPendingMax.set(0); poolActiveMax.set(0); poolPendingSamples.set(0);
+            ioErrorByType.clear(); ioErrorSample.clear();
+            tomcatSamples.set(0); tomcatBusySum.set(0); tomcatBusyMax.set(0); tomcatQueueSum.set(0);
+            tomcatQueueMax.set(0); tomcatSaturatedSamples.set(0); tomcatQueuedSamples.set(0);
         }
     }
 
     /** 스윕 한 구간의 요약. 마지막에 표로 묶어 "어디서 꺾이는지" 보여준다. */
-    record PhaseResult(int bidders, double successPerSec, double rejectRate,
+    record PhaseResult(int auctions, int bidders, double successPerSec, double requestsPerSec, double rejectRate,
                        double respP50, double respP95, double propP95,
-                       double entryP95, double waitP95, double avgPending) {
+                       double entryP95, double waitP95, double avgPending,
+                       double avgTomcatQueue, int ioErrors, double userCacheHitRate) {
+    }
+
+    /**
+     * 구간 하나 동안의 캐시 통계 증가분(구간 끝 - 구간 시작). 읽을 수 없는 캐시는 null.
+     * [왜 증가분인가] Caffeine 통계는 컨텍스트 수명 동안 누적되어, 앞 구간의 적중/미스가 섞이면 구간별 비교가 안 된다.
+     */
+    record CacheDeltas(CacheStats auctionId, CacheStats userSummary) {
+    }
+
+    /** 이름으로 캐시를 찾아 Caffeine 원본 통계를 돌려준다. Caffeine이 아니거나 없으면 null(리포트에 "읽을 수 없음"). */
+    private CacheStats cacheStats(String cacheName) {
+        Cache cache = cacheManager.getCache(cacheName);
+        if (cache instanceof CaffeineCache caffeine) {
+            return caffeine.getNativeCache().stats();
+        }
+        return null;
+    }
+
+    /** 구간 시작 스냅샷과 지금 통계의 차이. 어느 쪽이든 못 읽으면 null. */
+    private CacheStats cacheDelta(CacheStats before, String cacheName) {
+        CacheStats after = cacheStats(cacheName);
+        return before == null || after == null ? null : after.minus(before);
+    }
+
+    /** 경매 한 건의 정합성 점검 재료. bidCount 증가분 == 그 경매의 201 응답 수여야 한다. */
+    record AuctionCheck(int index, String publicId, int bidCountDelta, int created, long persistedBids) {
     }
 
     /**
@@ -309,39 +418,59 @@ class HotAuctionLoadTest {
     void 인기_경매_입찰_폭주_부하() throws Exception {
         assertSafeDatabase();
 
-        // ── 준비: 판매자 1명, 경매 1건, 입찰자 N명 ────────────────────────────────
+        // ── 준비: 판매자 1명, 경매 최대 K건, 입찰자 (K × 경매당 최대 M)명 ─────────────
         cleanUp();
-        User seller = userRepository.save(user("seller-load@y.com", "셀러", "010-9999-0000"));
-        LocalDateTime now = LocalDateTime.now();
-        Auction auction = auctionRepository.save(Auction.builder()
-                .publicId(PublicIdGenerator.newUlid())
-                .sellerUserId(seller.getId())
-                .title("인기 경매").description("부하 테스트")
-                .category(AuctionCategory.ETC).itemCondition(AuctionItemCondition.USED)
-                .startPrice(10_000L).buyNowPrice(null)
-                .startAt(now.minusMinutes(1)).endAt(now.plusHours(2)) // 테스트 중 종료되지 않게
-                .build());
-        String auctionPublicId = auction.getPublicId();
-        metrics.latestPrice.set(auction.getCurrentPrice());
+        List<Integer> auctionPhases = auctionPhases();
+        List<Integer> bidderPhases = sweepPhases();
+        int maxAuctions = auctionPhases.stream().mapToInt(Integer::intValue).max().orElse(auctionCount);
+        int maxBidders = bidderPhases.stream().mapToInt(Integer::intValue).max().orElse(bidderCount);
 
-        // 스윕 구간 중 가장 큰 입찰자 수만큼 계정을 미리 만든다
-        int maxBidders = sweepPhases().stream().mapToInt(Integer::intValue).max().orElse(bidderCount);
-        List<String> tokens = new ArrayList<>();
-        for (int i = 0; i < maxBidders; i++) {
-            User bidder = userRepository.save(
-                    user("bidder-load-" + i + "@y.com", "입찰자" + i, String.format("010-7%03d-0000", i)));
-            tokens.add(jwtProvider.createAccessToken(bidder.getPublicId(), false));
+        User seller = userRepository.save(user("seller-load@y.com", "셀러", "010-0000-0001"));
+        LocalDateTime now = LocalDateTime.now();
+
+        // 경매는 가장 큰 구간 기준으로 한 번에 만든다. k개짜리 구간은 앞의 k개만 쓴다.
+        List<String> auctionIds = new ArrayList<>();
+        for (int a = 0; a < maxAuctions; a++) {
+            Auction auction = auctionRepository.save(Auction.builder()
+                    .publicId(PublicIdGenerator.newUlid())
+                    .sellerUserId(seller.getId())
+                    .title("인기 경매 " + (a + 1)).description("부하 테스트")
+                    .category(AuctionCategory.ETC).itemCondition(AuctionItemCondition.USED)
+                    .startPrice(10_000L).buyNowPrice(null)
+                    .startAt(now.minusMinutes(1)).endAt(now.plusHours(2)) // 테스트 중 종료되지 않게
+                    .build());
+            auctionIds.add(auction.getPublicId());
+            metrics.latestPrice.put(auction.getPublicId(), new AtomicLong(auction.getCurrentPrice()));
+        }
+
+        // 입찰 계정: 경매마다 서로 겹치지 않는 토큰 묶음(tokensByAuction[a][b]).
+        // 전화번호는 users.phone UNIQUE라 전역 일련번호로 만든다. "010-%04d-0000"은 9999명까지 유일.
+        List<List<String>> tokensByAuction = new ArrayList<>();
+        for (int a = 0; a < maxAuctions; a++) {
+            List<String> tokens = new ArrayList<>();
+            for (int b = 0; b < maxBidders; b++) {
+                int seq = a * maxBidders + b;
+                User bidder = userRepository.save(
+                        user("bidder-load-" + seq + "@y.com", "입찰자" + seq, String.format("010-%04d-0000", seq)));
+                tokens.add(jwtProvider.createAccessToken(bidder.getPublicId(), false));
+            }
+            tokensByAuction.add(tokens);
         }
 
         // broadcast 소요 시간 + 발행 시각 기록 (실제 전송은 callRealMethod로 그대로 수행)
         // 소요 시간은 LoadSamples에 바로 넣지 않고 ThreadLocal 슬롯에 놓는다 —
         // 이 호출은 락 보유 구간 안, 즉 요청 스레드 위에서 일어나므로
         // ServerTimingFilter가 "그 요청의" broadcast로 정확히 묶어 기록한다.
+        // 경매가 여럿이라 발행 시각 키는 destination(/topic/auction/{publicId})에서 뽑은 publicId를 쓴다.
+        // (AuctionCloseScheduler도 같은 토픽에 BidUpdateMessage가 아닌 payload를 보내므로 instanceof 가드 유지)
         doAnswer(invocation -> {
             long start = System.nanoTime();
+            Object destination = invocation.getArgument(0);
             Object payload = invocation.getArgument(1);
-            if (payload instanceof BidUpdateMessage message) {
-                metrics.publishedAtByPrice.putIfAbsent(message.currentPrice(), start);
+            if (payload instanceof BidUpdateMessage message
+                    && destination instanceof String dest && dest.startsWith(TOPIC_PREFIX)) {
+                metrics.publishedAtByPrice.putIfAbsent(
+                        priceKey(dest.substring(TOPIC_PREFIX.length()), message.currentPrice()), start);
             }
             try {
                 return invocation.callRealMethod();
@@ -350,44 +479,70 @@ class HotAuctionLoadTest {
             }
         }).when(messagingTemplate).convertAndSend(anyString(), any(Object.class));
 
-        // ── 구독자 N명 접속 ──────────────────────────────────────────────────────
         WebSocketStompClient stompClient = new WebSocketStompClient(
                 new SockJsClient(List.<Transport>of(new WebSocketTransport(new StandardWebSocketClient()))));
-        List<StompSession> sessions = new ArrayList<>();
-        for (int i = 0; i < subscriberCount; i++) {
-            StompSession session = stompClient
-                    .connectAsync("http://localhost:" + port + "/ws", new StompSessionHandlerAdapter() {})
-                    .get(10, TimeUnit.SECONDS);
-            session.subscribe("/topic/auction/" + auctionPublicId, frameHandler());
-            sessions.add(session);
-        }
-        Thread.sleep(1000); // 구독 등록이 브로커에 반영될 시간
 
-        // ── 동시성 스윕: -Dload.sweep=20,40,60,100 이면 값마다 순차 측정 ──────────
-        // 구독자와 경매는 그대로 두고 입찰자 수만 바꾼다. 그래야 무엇 때문에 달라졌는지 구분된다.
+        // ── 구간 순회: 경매 수(바깥) × 입찰자 수(안쪽) ────────────────────────────
+        // -Dload.auctionSweep=1,3,5 / -Dload.sweep=20,40 이면 곱집합으로 순차 측정한다.
+        // 구독자는 구간 시작에 "활성 경매마다" 붙이고 끝에 끊는다 — 놀고 있는 경매의 세션이 수치에 안 섞이게.
         // Hikari 샘플러는 구간마다 새로 띄운다(구간별 평균/대기비율을 따로 재야 하므로).
-        List<Integer> phases = sweepPhases();
         List<PhaseResult> results = new ArrayList<>();
 
-        for (int phaseBidders : phases) {
-            metrics.reset();                       // 구간마다 통계를 새로 모은다
-            int bidCountBefore = auctionRepository.findByPublicId(auctionPublicId).orElseThrow().getBidCount();
+        for (int phaseAuctions : auctionPhases) {
+            for (int phaseBidders : bidderPhases) {
+                List<String> activeIds = auctionIds.subList(0, phaseAuctions);
 
-            HikariDataSource hikari = unwrapHikari();
-            Thread poolSampler = startPoolSampler(hikari);
-            long wallNanos = runBiddingPhase(auctionPublicId, tokens, phaseBidders);
-            Thread.sleep(1000);                    // 마지막 메시지들이 도착할 시간
-            poolSampler.interrupt();
+                metrics.reset();                   // 구간마다 통계를 새로 모은다
+                // 캐시 통계는 컨텍스트 수명 동안 누적되므로, 구간 시작 시점을 찍어 두고 끝나면 차이만 쓴다.
+                CacheStats auctionCacheBefore = cacheStats(CacheNames.AUCTION_ID_BY_PUBLIC_ID);
+                CacheStats userCacheBefore = cacheStats(CacheNames.USER_SUMMARY_BY_PUBLIC_ID);
+                Map<String, Integer> bidCountBefore = new LinkedHashMap<>();
+                for (String id : activeIds) {
+                    bidCountBefore.put(id, auctionRepository.findByPublicId(id).orElseThrow().getBidCount());
+                }
 
-            Auction reloaded = auctionRepository.findByPublicId(auctionPublicId).orElseThrow();
-            long persistedBids = bidRepository.findByAuctionIdOrderByCreatedAtDesc(
-                    reloaded.getId(), org.springframework.data.domain.PageRequest.of(0, 1)).getTotalElements();
+                // 구독자: 활성 경매마다 subscriberCount개
+                List<StompSession> sessions = new ArrayList<>();
+                for (String id : activeIds) {
+                    for (int i = 0; i < subscriberCount; i++) {
+                        StompSession session = stompClient
+                                .connectAsync("http://localhost:" + port + "/ws", new StompSessionHandlerAdapter() {})
+                                .get(10, TimeUnit.SECONDS);
+                        session.subscribe(TOPIC_PREFIX + id, frameHandler(id));
+                        sessions.add(session);
+                    }
+                }
+                Thread.sleep(1000); // 구독 등록이 브로커에 반영될 시간
 
-            String report = buildReport(reloaded, persistedBids, wallNanos, hikari,
-                    phaseBidders, reloaded.getBidCount() - bidCountBefore);
-            System.out.println(report);
-            writeReport(report, "bidders" + phaseBidders);
-            results.add(snapshot(phaseBidders, wallNanos));
+                HikariDataSource hikari = unwrapHikari();
+                ThreadPoolExecutor tomcatPool = unwrapTomcatExecutor();
+                Thread poolSampler = startPoolSampler(hikari, tomcatPool);
+                long wallNanos = runBiddingPhase(activeIds, tokensByAuction, phaseBidders);
+                CacheDeltas cacheDeltas = new CacheDeltas(
+                        cacheDelta(auctionCacheBefore, CacheNames.AUCTION_ID_BY_PUBLIC_ID),
+                        cacheDelta(userCacheBefore, CacheNames.USER_SUMMARY_BY_PUBLIC_ID));
+                Thread.sleep(1000);                // 마지막 메시지들이 도착할 시간
+                poolSampler.interrupt();
+
+                // 구간이 끝났으니 이 구간 세션은 끊는다(다음 구간은 자기 몫만 새로 붙인다)
+                sessions.forEach(StompSession::disconnect);
+
+                List<AuctionCheck> checks = new ArrayList<>();
+                for (int a = 0; a < activeIds.size(); a++) {
+                    String id = activeIds.get(a);
+                    Auction reloaded = auctionRepository.findByPublicId(id).orElseThrow();
+                    long persistedBids = bidRepository.findByAuctionIdOrderByCreatedAtDesc(
+                            reloaded.getId(), org.springframework.data.domain.PageRequest.of(0, 1)).getTotalElements();
+                    AtomicInteger success = metrics.successByAuction.get(id);
+                    checks.add(new AuctionCheck(a + 1, id, reloaded.getBidCount() - bidCountBefore.get(id),
+                            success == null ? 0 : success.get(), persistedBids));
+                }
+
+                String report = buildReport(checks, wallNanos, hikari, tomcatPool, phaseAuctions, phaseBidders, sessions.size(), cacheDeltas);
+                System.out.println(report);
+                writeReport(report, "auctions" + phaseAuctions + "-bidders" + phaseBidders);
+                results.add(snapshot(phaseAuctions, phaseBidders, wallNanos, cacheDeltas));
+            }
         }
 
         if (results.size() > 1) {
@@ -397,65 +552,98 @@ class HotAuctionLoadTest {
         }
 
         // ── 정리 ────────────────────────────────────────────────────────────────
-        sessions.forEach(StompSession::disconnect);
         stompClient.stop();
         cleanUp();
     }
 
-    /** -Dload.sweep=20,40,60,100 → [20,40,60,100]. 없으면 단일 구간(-Dload.bidders). */
-    private List<Integer> sweepPhases() {
-        String sweep = System.getProperty("load.sweep");
-        if (sweep == null || sweep.isBlank()) {
-            return List.of(bidderCount);
-        }
-        List<Integer> phases = new ArrayList<>();
-        for (String part : sweep.split(",")) {
-            phases.add(Integer.parseInt(part.trim()));
-        }
-        return phases;
+    /** 경매 토픽 접두어. destination에서 publicId를 뽑고, 구독 경로를 만들 때 함께 쓴다. */
+    private static final String TOPIC_PREFIX = "/topic/auction/";
+
+    /** 전파/팬아웃 상관용 키. 경매가 다르면 금액이 같아도 섞이지 않는다. */
+    private static String priceKey(String publicId, long price) {
+        return publicId + ":" + price;
     }
 
-    /** 입찰자 n명으로 durationSeconds 동안 부하를 준다. 반환값은 실제 소요 나노초. */
-    private long runBiddingPhase(String auctionPublicId, List<String> tokens, int n) throws InterruptedException {
-        ExecutorService pool = Executors.newFixedThreadPool(n);
-        CountDownLatch done = new CountDownLatch(n);
+    /** -Dload.sweep=20,40,60,100 → [20,40,60,100] (경매당 입찰자 수). 없으면 단일 구간(-Dload.bidders). */
+    private List<Integer> sweepPhases() {
+        return parseList(System.getProperty("load.sweep"), bidderCount);
+    }
+
+    /** -Dload.auctionSweep=1,3,5 → [1,3,5]. 없으면 단일 구간(-Dload.auctions). */
+    private List<Integer> auctionPhases() {
+        return parseList(System.getProperty("load.auctionSweep"), auctionCount);
+    }
+
+    private static List<Integer> parseList(String csv, int fallback) {
+        if (csv == null || csv.isBlank()) {
+            return List.of(fallback);
+        }
+        List<Integer> values = new ArrayList<>();
+        for (String part : csv.split(",")) {
+            values.add(Integer.parseInt(part.trim()));
+        }
+        return values;
+    }
+
+    /**
+     * 활성 경매마다 입찰자 n명으로 durationSeconds 동안 부하를 준다. 반환값은 실제 소요 나노초.
+     * 스레드는 (경매 수 × n)개이고, 각 스레드는 자기 경매의 자기 토큰 하나에만 묶인다.
+     */
+    private long runBiddingPhase(List<String> activeIds, List<List<String>> tokensByAuction, int n)
+            throws InterruptedException {
+        int total = activeIds.size() * n;
+        ExecutorService pool = Executors.newFixedThreadPool(total);
+        CountDownLatch done = new CountDownLatch(total);
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(durationSeconds);
         long wallStart = System.nanoTime();
 
-        for (int i = 0; i < n; i++) {
-            String token = tokens.get(i);
-            pool.submit(() -> {
-                try {
-                    while (System.nanoTime() < deadline) {
-                        placeOneBid(auctionPublicId, token);
-                        Thread.sleep(ThreadLocalRandom.current().nextInt(thinkMillis / 2, thinkMillis * 2));
+        for (int a = 0; a < activeIds.size(); a++) {
+            String auctionPublicId = activeIds.get(a);
+            metrics.successByAuction.computeIfAbsent(auctionPublicId, k -> new AtomicInteger());
+            for (int i = 0; i < n; i++) {
+                String token = tokensByAuction.get(a).get(i);
+                pool.submit(() -> {
+                    try {
+                        while (System.nanoTime() < deadline) {
+                            placeOneBid(auctionPublicId, token);
+                            Thread.sleep(ThreadLocalRandom.current().nextInt(thinkMillis / 2, thinkMillis * 2));
+                        }
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    } finally {
+                        done.countDown();
                     }
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                } finally {
-                    done.countDown();
-                }
-            });
+                });
+            }
         }
         done.await(durationSeconds + 30L, TimeUnit.SECONDS);
         pool.shutdown();
         return System.nanoTime() - wallStart;
     }
 
-    private PhaseResult snapshot(int bidders, long wallNanos) {
+    private PhaseResult snapshot(int auctions, int bidders, long wallNanos, CacheDeltas cacheDeltas) {
+        double wallSeconds = wallNanos / 1_000_000_000.0;
         int created = metrics.created201.get();
         long total = created + metrics.tooLow400.get() + metrics.conflict409.get() + metrics.serverError500.get();
         int n = metrics.poolSamples.get();
         return new PhaseResult(
+                auctions,
                 bidders,
-                created / (wallNanos / 1_000_000_000.0),
+                created / wallSeconds,
+                total / wallSeconds,
                 total > 0 ? metrics.tooLow400.get() / (double) total : 0,
                 metrics.responseTime.percentileMillis(0.50),
                 metrics.responseTime.percentileMillis(0.95),
                 metrics.propagation.percentileMillis(0.95),
                 metrics.entry.percentileMillis(0.95),
                 metrics.lockWait.percentileMillis(0.95),
-                n > 0 ? metrics.poolPendingSum.get() / (double) n : 0);
+                n > 0 ? metrics.poolPendingSum.get() / (double) n : 0,
+                metrics.tomcatSamples.get() > 0
+                        ? metrics.tomcatQueueSum.get() / (double) metrics.tomcatSamples.get() : 0,
+                metrics.ioError.get(),
+                // 조회가 0건이거나 못 읽으면 -1 → 표에서 "-"로 찍는다
+                cacheDeltas.userSummary() != null && cacheDeltas.userSummary().requestCount() > 0
+                        ? cacheDeltas.userSummary().hitRate() * 100 : -1);
     }
 
     /** 스윕 결과를 한 표로 묶고 최적 동시성을 짚어준다. */
@@ -467,30 +655,35 @@ class HotAuctionLoadTest {
             }
         }
         StringBuilder sb = new StringBuilder();
-        sb.append(String.format("%n━━ 동시성 스윕 ━━ 구독자 %d / 각 %d초 ━━%n", subscriberCount, durationSeconds));
-        sb.append(String.format("%-8s %9s %8s %9s %9s %9s %9s %9s %9s%n",
-                "입찰자", "성공/s", "거절률", "응답p50", "응답p95", "전파p95", "(a)p95", "(b)p95", "pending"));
+        sb.append(String.format("%n━━ 동시성 스윕 ━━ 구독자 %d(경매당) / 각 %d초 ━━%n", subscriberCount, durationSeconds));
+        sb.append(String.format("%-6s %-11s %9s %9s %8s %9s %9s %9s %9s %9s %9s %10s %7s %14s%n",
+                "경매", "입찰자/경매", "성공/s", "전체req/s", "거절률", "응답p50", "응답p95", "전파p95", "(a)p95", "(b)p95", "pending", "tomcat대기", "IO오류",
+                "사용자캐시적중"));
         for (PhaseResult r : results) {
-            sb.append(String.format("%-8d %9.1f %7.0f%% %8.1fms %8.1fms %8.1fms %8.1fms %8.1fms %9.1f%s%n",
-                    r.bidders(), r.successPerSec(), r.rejectRate() * 100,
+            String userHit = r.userCacheHitRate() < 0 ? "-" : String.format("%.2f%%", r.userCacheHitRate());
+            sb.append(String.format("%-6d %-11d %9.1f %9.1f %7.0f%% %8.1fms %8.1fms %8.1fms %8.1fms %8.1fms %9.1f %10.1f %7d %14s%s%n",
+                    r.auctions(), r.bidders(), r.successPerSec(), r.requestsPerSec(), r.rejectRate() * 100,
                     r.respP50(), r.respP95(), r.propP95(), r.entryP95(), r.waitP95(), r.avgPending(),
+                    r.avgTomcatQueue(), r.ioErrors(), userHit,
                     r == best ? "  <- 최대" : ""));
         }
-        sb.append(String.format("%n→ 최적 동시성: 입찰자 %d명 부근 (성공 %.1f/s)%n", best.bidders(), best.successPerSec()));
+        sb.append(String.format("%n→ 최적 동시성: 경매 %d개 × 입찰자 %d명(경매당) 부근 (성공 합계 %.1f/s)%n",
+                best.auctions(), best.bidders(), best.successPerSec()));
         PhaseResult last = results.get(results.size() - 1);
         if (best != last && best.successPerSec() > 0) {
-            sb.append(String.format("→ 입찰자 %d명에서는 %.0f%% 수준으로 떨어진다 — 동시성을 늘릴수록 손해인 구간%n",
-                    last.bidders(), last.successPerSec() / best.successPerSec() * 100));
+            sb.append(String.format("→ 경매 %d개 × 입찰자 %d명에서는 %.0f%% 수준으로 떨어진다 — 동시성을 늘릴수록 손해인 구간%n",
+                    last.auctions(), last.bidders(), last.successPerSec() / best.successPerSec() * 100));
         }
         return sb.toString();
     }
 
-    /** 입찰 1건: 화면에 보이는 현재가 위로 금액을 정하고 실제 HTTP POST를 보낸다. */
+    /** 입찰 1건: 그 경매의 화면에 보이는 현재가 위로 금액을 정하고 실제 HTTP POST를 보낸다. */
     private void placeOneBid(String auctionPublicId, String token) {
-        long base = metrics.latestPrice.get();
+        AtomicLong latest = metrics.latestPrice.get(auctionPublicId);
+        long base = latest.get();
         long amount = base + INCREMENT * (1 + ThreadLocalRandom.current().nextInt(3));
         long start = System.nanoTime();
-        metrics.sentAtByPrice.putIfAbsent(amount, start);
+        metrics.sentAtByPrice.putIfAbsent(priceKey(auctionPublicId, amount), start);
         try {
             HttpRequest request = HttpRequest.newBuilder()
                     .uri(URI.create("http://localhost:" + port + "/api/v1/auctions/" + auctionPublicId + "/bids"))
@@ -505,7 +698,9 @@ class HotAuctionLoadTest {
             switch (response.statusCode()) {
                 case 201 -> {
                     metrics.created201.incrementAndGet();
-                    metrics.latestPrice.accumulateAndGet(amount, Math::max);
+                    metrics.successByAuction.computeIfAbsent(auctionPublicId, k -> new AtomicInteger())
+                            .incrementAndGet();
+                    latest.accumulateAndGet(amount, Math::max); // 이 경매의 현재가만 갱신
                 }
                 // [왜 거절 응답의 minimumBid를 반영하지 않나 — 측정으로 확인했다]
                 //   서버는 BID_TOO_LOW에 유효 입찰가를 실어 보낸다. 그걸 읽어 다음 입찰에 쓰도록
@@ -520,12 +715,15 @@ class HotAuctionLoadTest {
                 default -> metrics.otherStatus.incrementAndGet();
             }
         } catch (Exception e) {
-            metrics.ioError.incrementAndGet();
+            metrics.recordIoError(e); // 개수 + 예외 유형별 집계(타임아웃/연결 거절 등 구분용)
         }
     }
 
-    /** 구독자가 BID_UPDATE를 받을 때마다 전파 지연/팬아웃을 기록하고 현재가를 갱신한다. */
-    private StompFrameHandler frameHandler() {
+    /**
+     * 구독자가 BID_UPDATE를 받을 때마다 전파 지연/팬아웃을 기록하고 "구독 중인 그 경매의" 현재가를 갱신한다.
+     * auctionPublicId를 받아 두는 이유: 프레임 본문만으로는 어느 경매인지 몰라 키를 만들 수 없다.
+     */
+    private StompFrameHandler frameHandler(String auctionPublicId) {
         return new StompFrameHandler() {
             @Override @NonNull public Type getPayloadType(@NonNull StompHeaders headers) {
                 return byte[].class; // 기본 SimpleMessageConverter — 원문 그대로 받아 직접 파싱
@@ -539,13 +737,14 @@ class HotAuctionLoadTest {
                         return;
                     }
                     long price = node.path("currentPrice").asLong();
-                    metrics.latestPrice.accumulateAndGet(price, Math::max);
+                    metrics.latestPrice.get(auctionPublicId).accumulateAndGet(price, Math::max);
 
-                    Long sentAt = metrics.sentAtByPrice.get(price);
+                    String key = priceKey(auctionPublicId, price);
+                    Long sentAt = metrics.sentAtByPrice.get(key);
                     if (sentAt != null) {
                         metrics.propagation.add(received - sentAt);
                     }
-                    Long publishedAt = metrics.publishedAtByPrice.get(price);
+                    Long publishedAt = metrics.publishedAtByPrice.get(key);
                     if (publishedAt != null) {
                         metrics.fanout.add(received - publishedAt);
                     }
@@ -556,9 +755,29 @@ class HotAuctionLoadTest {
         };
     }
 
-    private Thread startPoolSampler(HikariDataSource hikari) {
+    /**
+     * 100ms마다 Hikari 풀과 Tomcat 요청 스레드풀을 한 스레드에서 같이 샘플링한다.
+     * Tomcat은 busy(getActiveCount) / 큐 길이(getQueue().size() = 워커를 못 받아 대기 중인 요청)를 모은다.
+     * tomcatPool이 null이면(executor를 못 얻음) Tomcat 샘플은 건너뛴다.
+     */
+    private Thread startPoolSampler(HikariDataSource hikari, ThreadPoolExecutor tomcatPool) {
         Thread thread = new Thread(() -> {
             while (!Thread.currentThread().isInterrupted()) {
+                if (tomcatPool != null) {
+                    int busy = tomcatPool.getActiveCount();
+                    int queue = tomcatPool.getQueue().size();
+                    metrics.tomcatSamples.incrementAndGet();
+                    metrics.tomcatBusySum.addAndGet(busy);
+                    metrics.tomcatBusyMax.accumulateAndGet(busy, Math::max);
+                    metrics.tomcatQueueSum.addAndGet(queue);
+                    metrics.tomcatQueueMax.accumulateAndGet(queue, Math::max);
+                    if (busy >= tomcatPool.getMaximumPoolSize()) {
+                        metrics.tomcatSaturatedSamples.incrementAndGet();
+                    }
+                    if (queue > 0) {
+                        metrics.tomcatQueuedSamples.incrementAndGet();
+                    }
+                }
                 if (hikari != null) {
                     var mx = hikari.getHikariPoolMXBean();
                     int pending = mx.getThreadsAwaitingConnection();
@@ -593,6 +812,30 @@ class HotAuctionLoadTest {
         }
     }
 
+    /**
+     * 내장 Tomcat의 요청 처리 스레드풀을 꺼낸다.
+     * 경로: WebServerApplicationContext.getWebServer() → TomcatWebServer.getTomcat().getConnector()
+     *        .getProtocolHandler().getExecutor() → Tomcat 자체 ThreadPoolExecutor.
+     * [왜 JMX가 아닌가] 스프링 부트는 Tomcat MBean 레지스트리를 기본으로 꺼 둬서 JMX로는 안 보인다.
+     * 못 얻으면(다른 서버/타입 불일치) null을 돌려주고 리포트가 "읽을 수 없음"으로 표기한다 — unwrapHikari와 같은 패턴.
+     */
+    private ThreadPoolExecutor unwrapTomcatExecutor() {
+        try {
+            if (applicationContext instanceof WebServerApplicationContext webContext) {
+                WebServer server = webContext.getWebServer();
+                if (server instanceof TomcatWebServer tomcat) {
+                    Executor executor = tomcat.getTomcat().getConnector().getProtocolHandler().getExecutor();
+                    if (executor instanceof ThreadPoolExecutor pool) {
+                        return pool;
+                    }
+                }
+            }
+        } catch (Exception e) {
+            // 아래에서 null 반환
+        }
+        return null;
+    }
+
     private String databaseProduct() {
         try (Connection connection = dataSource.getConnection()) {
             return connection.getMetaData().getDatabaseProductName()
@@ -604,8 +847,30 @@ class HotAuctionLoadTest {
 
     // ── 리포트 ──────────────────────────────────────────────────────────────────
 
-    private String buildReport(Auction auction, long persistedBids, long wallNanos, HikariDataSource hikari,
-                               int phaseBidders, int bidCountDelta) {
+    /**
+     * [캐시] 섹션. 읽는 법: 미스는 이 구간에서 처음 보는 경매/입찰자 수와 비슷해야 정상이다.
+     * 적중률이 그보다 훨씬 낮으면 캐시가 우회되고 있다는 뜻(키 불일치, 프록시 밖 호출 등).
+     */
+    private String cacheSection(CacheDeltas deltas) {
+        return cacheLine("경매 ID    ", deltas.auctionId()) + cacheLine("사용자 요약", deltas.userSummary());
+    }
+
+    private String cacheLine(String label, CacheStats stats) {
+        if (stats == null) {
+            return String.format("  %s (캐시 통계를 읽을 수 없음)%n", label);
+        }
+        String hit = stats.requestCount() == 0 ? "-" : String.format("%.2f%%", stats.hitRate() * 100);
+        return String.format("  %s  조회 %,d회   적중 %s   미스 %,d회%n", label, stats.requestCount(), hit, stats.missCount());
+    }
+
+    /**
+     * 구간 리포트. 지연/풀 지표는 구간 전체(모든 활성 경매)를 합친 값이고,
+     * 처리량·정합성은 경매별로 따로 보여준다(경매 간 몫이 고른지 확인하려고).
+     * 한 경매의 상한(락 보유 1/p50)은 "경매당" 값이라 실제 처리량도 경매 평균으로 맞춰 비교한다.
+     */
+    private String buildReport(List<AuctionCheck> checks, long wallNanos, HikariDataSource hikari,
+                               ThreadPoolExecutor tomcatPool, int phaseAuctions, int phaseBidders, int totalSessions,
+                               CacheDeltas cacheDeltas) {
         double wallSeconds = wallNanos / 1_000_000_000.0;
 
         // 입찰 스레드 측정 — POST 보내고 답 받기까지
@@ -627,7 +892,13 @@ class HotAuctionLoadTest {
         double castP50 = metrics.broadcast.percentileMillis(0.50);
         double castP95 = metrics.broadcast.percentileMillis(0.95);
 
-        // 부하 생성기 몫: 입찰 스레드 응답 - 서버 처리. 같은 JVM이면 여기가 부풀어 오른다.
+        // [Tomcat 포화] busy가 maxThreads에 붙은 샘플 비율. 20%를 넘으면 요청이 필터 도달 전에 대기열에서 기다린 것.
+        //   이 대기는 ServerTimingFilter 밖이라 아래 "필터 밖" 몫에 섞여 들어간다.
+        double tomcatSatRatio = metrics.tomcatSamples.get() > 0
+                ? metrics.tomcatSaturatedSamples.get() / (double) metrics.tomcatSamples.get() : 0;
+        boolean tomcatSaturated = tomcatSatRatio > 0.20;
+
+        // 필터 밖 몫: 입찰 스레드 응답 - 서버(필터) 처리 = Tomcat 큐 대기 + 네트워크 + 부하 생성기 비용.
         double generatorP50 = Math.max(0, respP50 - srvP50);
         double generatorP95 = Math.max(0, respP95 - srvP95);
 
@@ -649,7 +920,9 @@ class HotAuctionLoadTest {
         double holdSuccessP95 = metrics.lockHoldSuccess.percentileMillis(0.95);
         double txSuccessP50 = metrics.transactionSuccess.percentileMillis(0.50);
         double throughputCap = holdSuccessP50 > 0 ? 1000.0 / holdSuccessP50 : 0;
-        double actualThroughput = created / wallSeconds;
+        double aggregateThroughput = created / wallSeconds;                 // 모든 경매 합계 성공/s
+        double actualThroughput = aggregateThroughput / phaseAuctions;      // 경매 1건당 평균 성공/s (경매당 상한과 비교용)
+        double requestsPerSec = totalRequests / wallSeconds;                // 201+400+409+500 전체 요청/s
 
         // [포화 판정] 아래 중 하나라도 걸리면 이미 밀어붙일 만큼 밀어붙인 상태다.
         //   여기서 "부하를 더 올려라"라고 안내하면 안 된다.
@@ -659,16 +932,22 @@ class HotAuctionLoadTest {
         boolean lockQueued = srvP95 > 0 && waitP95 > srvP95 * 0.25;
         boolean saturated = poolStarved || lockQueued || rejectRate > 0.5;
         boolean goalMet = propP95 > 0 && propP95 < 1000;
-        boolean consistent = bidCountDelta == created;
+        // 정합성: 전 경매 bidCount 증가분의 합 == 201 합계. 경매별로도 따로 맞는지 본다.
+        int deltaSum = checks.stream().mapToInt(AuctionCheck::bidCountDelta).sum();
+        boolean consistent = deltaSum == created;
 
         StringBuilder sb = new StringBuilder();
-        sb.append(String.format("%n━━ 인기 경매 부하 ━━ 구독자 %d / 입찰자 %d / %d초 ━━%n",
-                subscriberCount, phaseBidders, durationSeconds));
+        sb.append(String.format("%n━━ 인기 경매 부하 ━━ 경매 %d건 / 입찰자 %d(경매당) / 구독자 %d(경매당) / %d초 ━━%n",
+                phaseAuctions, phaseBidders, subscriberCount, durationSeconds));
+        sb.append(String.format("입찰 스레드 총 %d개 / STOMP 세션 총 %d개%n",
+                phaseAuctions * phaseBidders, totalSessions));
         sb.append(String.format("DB: %s%n", databaseProduct()));
 
         sb.append(String.format("%n[응답]%n"));
         sb.append(String.format("  입찰 API 응답        p50 %6.1fms   p95 %6.1fms   p99 %6.1fms%n",
                 respP50, respP95, respP99));
+        sb.append(String.format("  전체 요청 처리량     ~ %.1f req/sec   (201+400+409+500 = %,d건 / %.1f초)%n",
+                requestsPerSec, totalRequests, wallSeconds));
         sb.append(String.format("  전파 지연            p50 %6.1fms   p95 %6.1fms   p99 %6.1fms    목표 p95 < 1000ms  %s%n",
                 propP50, propP95, propP99, goalMet ? "OK" : "FAIL"));
 
@@ -678,8 +957,14 @@ class HotAuctionLoadTest {
         sb.append(segment("  (b) 락 대기", waitP50, waitP95, srvP95));
         sb.append(segment("  (c) 트랜잭션", txP50, txP95, srvP95));
         sb.append(segment("  (d) broadcast", castP50, castP95, srvP95));
-        sb.append(String.format("  %-26s %6.1fms / %6.1fms   %s%n", "네트워크+부하 생성기", generatorP50, generatorP95,
-                generatorP95 > srvP95 ? "<- 부하 생성기가 같은 JVM. 서버 성능 아님" : ""));
+        String outsideNote = "";
+        if (generatorP95 > srvP95) {
+            outsideNote = tomcatSaturated
+                    ? "<- Tomcat 큐 대기(실제 서버 병목)가 부하 생성기 비용과 섞여 있음"
+                    : "<- 부하 생성기가 같은 JVM. 서버 성능 아님";
+        }
+        sb.append(String.format("  %-26s %6.1fms / %6.1fms   %s%n", "필터 밖 (Tomcat 대기+네트워크+생성기)",
+                generatorP50, generatorP95, outsideNote));
         sb.append(String.format("  %-26s %6.1fms / %6.1fms%n", "(f) 팬아웃", fanP50, fanP95));
 
         sb.append(String.format("%n[락]%n"));
@@ -687,9 +972,11 @@ class HotAuctionLoadTest {
                 holdP50, holdP95));
         sb.append(String.format("  보유 시간 (성공만)   p50 %6.1fms   p95 %6.1fms   (그중 트랜잭션 %.1fms)%n",
                 holdSuccessP50, holdSuccessP95, txSuccessP50));
-        sb.append(String.format("  단일 경매 상한       ~ %.0f bids/sec   (1 / 성공 보유 p50)%n", throughputCap));
-        sb.append(String.format("  실제 성공 처리량     ~ %.1f bids/sec   (상한의 %.0f%%)%n",
+        sb.append(String.format("  경매당 상한          ~ %.0f bids/sec   (1 / 성공 보유 p50, 경매 1건 기준)%n", throughputCap));
+        sb.append(String.format("  경매당 성공 처리량   ~ %.1f bids/sec   (경매 평균, 상한의 %.0f%%)%n",
                 actualThroughput, throughputCap > 0 ? actualThroughput / throughputCap * 100 : 0));
+        sb.append(String.format("  집계 성공 처리량     ~ %.1f bids/sec   (경매 %d건 합계)%n",
+                aggregateThroughput, phaseAuctions));
         if (saturated) {
             sb.append(String.format("  -> 이미 포화 상태다(%s). 부하를 더 올려도 성공 처리량은 늘지 않는다.%n",
                     saturationReason(poolStarved, lockQueued, rejectRate)));
@@ -704,6 +991,10 @@ class HotAuctionLoadTest {
 
         sb.append(String.format("%n[DB]%n"));
         sb.append(poolSection(hikari));
+        sb.append(String.format("%n[캐시]%n"));
+        sb.append(cacheSection(cacheDeltas));
+        sb.append(String.format("%n[Tomcat]%n"));
+        sb.append(tomcatSection(tomcatPool));
 
         sb.append(String.format("%n[결과 분포]%n"));
         sb.append(String.format("  201                %,6d   (성공)%n", created));
@@ -717,12 +1008,37 @@ class HotAuctionLoadTest {
             sb.append(String.format("  기타/IO오류        %,6d / %,6d%n",
                     metrics.otherStatus.get(), metrics.ioError.get()));
         }
+        if (metrics.ioError.get() > 0) {
+            sb.append(String.format("  IO오류 유형별 (개수 내림차순):%n"));
+            metrics.ioErrorByType.entrySet().stream()
+                    .sorted((x, y) -> y.getValue().get() - x.getValue().get())
+                    .forEach(en -> sb.append(String.format("    %,6d  %s   예: %s%n",
+                            en.getValue().get(), en.getKey(), metrics.ioErrorSample.get(en.getKey()))));
+        }
 
-        sb.append(String.format("%n[정합성]  이번 구간 bidCount 증가 %d == 201응답 %d  %s   (경매 누적 bids행 %d)%n",
-                bidCountDelta, created, consistent ? "OK" : "FAIL", persistedBids));
+        // 경매별 성공/s: 처리량이 경매 사이에 고르게 나뉘는지 본다. (min/max 비율이 1에 가까울수록 고름)
+        sb.append(String.format("%n[경매별 성공 처리량]%n"));
+        double minRate = Double.MAX_VALUE;
+        double maxRate = 0;
+        for (AuctionCheck c : checks) {
+            double rate = c.created() / wallSeconds;
+            minRate = Math.min(minRate, rate);
+            maxRate = Math.max(maxRate, rate);
+            sb.append(String.format("  경매 %-3d  성공 %,6d건   %7.1f bids/sec%n", c.index(), c.created(), rate));
+        }
+        sb.append(String.format("  min %.1f / max %.1f bids/sec   (min/max = %.2f)%n",
+                minRate, maxRate, maxRate > 0 ? minRate / maxRate : 0));
+
+        sb.append(String.format("%n[정합성]  이번 구간 bidCount 증가 합계 %d == 201응답 합계 %d  %s%n",
+                deltaSum, created, consistent ? "OK" : "FAIL"));
+        for (AuctionCheck c : checks) {
+            sb.append(String.format("  경매 %-3d  bidCount 증가 %d == 201응답 %d  %s   (누적 bids행 %d)%n",
+                    c.index(), c.bidCountDelta(), c.created(),
+                    c.bidCountDelta() == c.created() ? "OK" : "FAIL", c.persistedBids()));
+        }
 
         sb.append(String.format("%n[판정 힌트] %s%n",
-                verdict(entryP95, waitP95, txP95, castP95, srvP95, generatorP95, holdP95)));
+                verdict(entryP95, waitP95, txP95, castP95, srvP95, generatorP95, holdP95, tomcatSaturated)));
         return sb.toString();
     }
 
@@ -766,13 +1082,53 @@ class HotAuctionLoadTest {
     }
 
     /**
+     * Tomcat 요청 스레드풀 상태. busy = 요청을 처리 중인 워커, queue = 워커를 못 받아 대기 중인 요청.
+     * Hikari와 같은 이유로 최대값이 아니라 평균과 "포화/대기가 있었던 시간 비율"로 지속성을 판단한다.
+     */
+    private String tomcatSection(ThreadPoolExecutor pool) {
+        int n = metrics.tomcatSamples.get();
+        if (pool == null || n == 0) {
+            return "  (Tomcat 스레드풀 정보를 읽을 수 없음)\n";
+        }
+        int max = pool.getMaximumPoolSize();
+        double avgBusy = metrics.tomcatBusySum.get() / (double) n;
+        double avgQueue = metrics.tomcatQueueSum.get() / (double) n;
+        double satRatio = metrics.tomcatSaturatedSamples.get() / (double) n;
+        double queuedRatio = metrics.tomcatQueuedSamples.get() / (double) n;
+
+        String judgement;
+        if (satRatio > 0.20) {
+            judgement = "Tomcat 스레드 포화 — 요청이 필터 도달 전에 대기열에서 기다림. 이 대기는 '필터 밖' 시간에 포함됨";
+        } else if (metrics.tomcatQueueMax.get() > 0) {
+            judgement = String.format("순간 스파이크만(대기열 발생 구간 %.1f%%) — 정상 구간은 여유", queuedRatio * 100);
+        } else {
+            judgement = "여유";
+        }
+
+        StringBuilder sb = new StringBuilder();
+        sb.append(String.format("  busy     평균 %.1f / 최대 %d   (최대 스레드 %d, 사용률 %.0f%%)%n",
+                avgBusy, metrics.tomcatBusyMax.get(), max, avgBusy / max * 100));
+        sb.append(String.format("  queue    평균 %.1f / 최대 %d%n", avgQueue, metrics.tomcatQueueMax.get()));
+        sb.append(String.format("  포화 구간 %.1f%% (busy == 최대)   대기열 발생 구간 %.1f%%%n",
+                satRatio * 100, queuedRatio * 100));
+        sb.append(String.format("  판정: %s%n", judgement));
+        return sb.toString();
+    }
+
+    /**
      * 어디가 병목인지 한 줄로 요약한다.
      * 서버 내부 구간끼리만 비교하고, 부하 생성기 비용이 서버보다 크면 그 사실을 먼저 알린다.
      */
     private String verdict(double entry, double wait, double tx, double cast,
-                           double server, double generator, double hold) {
+                           double server, double generator, double hold, boolean tomcatSaturated) {
         if (server == 0) {
             return "샘플 부족 — 지속 시간을 늘리거나 입찰자를 늘려볼 것";
+        }
+        if (generator > server && tomcatSaturated) {
+            return String.format(
+                    "필터 밖 시간(%.1fms)이 서버 처리(%.1fms)보다 큼 + Tomcat 스레드 포화 — 요청이 필터 도달 전 Tomcat 큐에서 대기한 "
+                            + "실제 서버 병목이 부하 생성기 비용과 섞여 있다. server.tomcat.threads.max와 입찰 스레드 수를 함께 볼 것",
+                    generator, server);
         }
         if (generator > server) {
             return String.format(

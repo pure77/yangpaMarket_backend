@@ -23,6 +23,10 @@ dependencies {
 	implementation 'org.springframework.boot:spring-boot-starter-websocket'
 	implementation 'org.springframework.boot:spring-boot-starter-security'
 	implementation 'org.springframework.boot:spring-boot-starter-validation'
+	// [캐시] Spring Cache 추상화(@Cacheable) + 저장소 Caffeine(서버 메모리).
+	// 입찰 경로의 락 밖 조회(경매 ID, 사용자 요약)를 캐시해 DB 커넥션 획득을 줄인다. 설정은 CacheConfig.
+	implementation 'org.springframework.boot:spring-boot-starter-cache'
+	implementation 'com.github.ben-manes.caffeine:caffeine'
 	implementation 'org.flywaydb:flyway-core'
 	implementation 'com.github.f4b6a3:ulid-creator:5.2.3'
 	implementation 'io.jsonwebtoken:jjwt-api:0.12.6'
@@ -48,8 +52,10 @@ tasks.named('test') {
 	// [부하 테스트 스위치] HotAuctionLoadTest는 평소엔 건너뛴다(수십 초 걸림).
 	// 돌릴 때만: ./gradlew.bat test --tests '*HotAuctionLoadTest*' -Dloadtest=true
 	// 파라미터도 같은 방식으로 넘긴다: -Dload.subscribers=100 -Dload.bidders=20 -Dload.seconds=60
+	// load.auctions(인기 경매 수) / load.auctionSweep(경매 수 스윕, 예: 1,3,5)도 같은 방식.
+	// load.bidders / load.subscribers 는 "경매당" 값이다.
 	['loadtest', 'load.profile', 'load.subscribers', 'load.bidders', 'load.seconds', 'load.thinkMillis',
-	 'load.poolSize', 'load.sweep'].each { key ->
+	 'load.poolSize', 'load.sweep', 'load.auctions', 'load.auctionSweep'].each { key ->
 		if (System.getProperty(key) != null) {
 			systemProperty key, System.getProperty(key)
 		}
