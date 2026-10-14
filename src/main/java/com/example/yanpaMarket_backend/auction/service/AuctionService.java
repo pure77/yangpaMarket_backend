@@ -35,7 +35,7 @@ import org.springframework.transaction.annotation.Transactional;
  * 경매 CRUD 서비스.
  *
  * 핵심 정책:
- *  - 등록 시 start_at = now + 공개유예(기본 10초, 테스트용). 그 전엔 공개 목록 비노출/입찰 불가.
+ *  - 등록 시 start_at = now + 공개유예(기본 60초). 그 전엔 공개 목록 비노출/입찰 불가.
  *  - 수정/삭제는 소유자 && 입찰 0건일 때만(isModifiable). 아니면 FORBIDDEN/CANNOT_MODIFY.
  *  - 삭제는 소프트 취소(cancel).
  *
@@ -62,8 +62,8 @@ public class AuctionService {
     private final ImageRepository imageRepository;
     private final UserRepository userRepository;
 
-    // application.properties: app.auction.publish-delay-seconds=10 (기본값 10초, 테스트용)
-    @Value("${app.auction.publish-delay-seconds:10}")
+    // application.properties: app.auction.publish-delay-seconds=60 (기본값 60초)
+    @Value("${app.auction.publish-delay-seconds:60}")
     private long publishDelaySeconds;
 
     /**
@@ -84,7 +84,7 @@ public class AuctionService {
                 .itemCondition(request.condition())
                 .startPrice(request.startPrice())
                 .buyNowPrice(request.buyNowPrice())
-                .startAt(now.plusSeconds(publishDelaySeconds)) // 공개 유예 (테스트용 10초)
+                .startAt(now.plusSeconds(publishDelaySeconds)) // 공개 유예 (기본 60초)
                 .endAt(request.endTime())
                 .build();
         auctionRepository.save(auction);
