@@ -1,0 +1,26 @@
+# 배포(prod) 프로필 전용 설정.
+#
+# 활성화: SPRING_PROFILES_ACTIVE=prod
+#   (DB 등 기존 secret 설정과 함께 쓰려면 SPRING_PROFILES_ACTIVE=prod,secret)
+#
+# prod 프로필에서는 S3ImageStorage가 활성화되어 이미지가 S3에 저장된다.
+# 자격증명(AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY)은 코드/설정에 두지 않고
+# 환경변수 또는 EC2/ECS 인스턴스 프로파일에서 DefaultCredentialsProvider가 읽는다.
+app:
+  # [CORS] 허용할 프론트 출처. 쉼표로 여러 개 지정 가능(예: https://yangpa.com,https://www.yangpa.com).
+  # 와일드카드 패턴도 가능하다(예: https://*.yangpa.com) — WebSocketConfig/SecurityConfig 모두
+  # "Patterns" API를 쓰기 때문.
+  #
+  # 기본값을 일부러 두지 않았다. 미설정 시 애플리케이션이 기동되지 않는다.
+  # CORS를 빠뜨린 채 배포되면 "서버는 떴는데 프론트만 안 붙는" 장애가 되어 원인 찾기가 어렵다.
+  # 차라리 뜨지 않는 편이 낫다는 판단.
+  cors:
+    allowed-origins: ${CORS_ALLOWED_ORIGINS}
+  s3:
+    bucket: ${AWS_S3_BUCKET}
+    region: ${AWS_S3_REGION:ap-northeast-2}
+    # 객체 키 접두어. 비우면 prefix 없이 저장.
+    key-prefix: ${AWS_S3_KEY_PREFIX:images/}
+    # 서빙 URL 기준 도메인. 비우면 S3 기본 URL 사용.
+    # 추후 CloudFront로 교체 시 이 값에 CDN 도메인만 넣으면 된다(코드 변경 불필요).
+    public-base-url: ${AWS_S3_PUBLIC_BASE_URL:}
