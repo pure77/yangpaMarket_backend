@@ -5,7 +5,7 @@ Spring Boot 기반 경매 백엔드 API 서버입니다.
 현재 코드는 초기 스캐폴딩 단계이며, 상세 API 설계는 `docs/` 문서에 정리되어 있습니다.
 
 ## Tech Stack
-- Runtime: Java 17
+- Runtime: Java 25 (Gradle toolchain)
 - Framework: Spring Boot 4.0.5
 - Build: Gradle Wrapper
 - Data: Spring Data JPA + MySQL Connector/J

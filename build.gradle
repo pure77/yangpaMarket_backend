@@ -9,12 +9,20 @@ version = '0.0.1-SNAPSHOT'
 
 java {
 	toolchain {
-		languageVersion = JavaLanguageVersion.of(18)
+		// [Java 25 = 최신 LTS] 18은 2022-09에 지원이 끝난 비 LTS라 보안 패치가 없다.
+		//   Spring Boot 4.0.x·4.1.x 모두 Java 17~27을 지원한다. 25부터 sealed 타입 switch 패턴 매칭을 쓴다.
+		languageVersion = JavaLanguageVersion.of(25)
 	}
 }
 
 repositories {
 	mavenCentral()
+}
+
+// [Mockito 에이전트] Java 21+는 테스트 중에 에이전트를 "동적으로" 붙이면 경고를 내고, 향후 JDK는 기본 차단한다.
+//   그러면 @MockitoSpyBean 같은 인라인 목이 깨질 수 있다. Mockito 공식 권장대로 JVM 시작 시 -javaagent로 붙인다.
+configurations {
+	mockitoAgent
 }
 
 dependencies {
@@ -39,6 +47,7 @@ dependencies {
 	annotationProcessor 'org.projectlombok:lombok'
 	testImplementation 'org.springframework.boot:spring-boot-starter-test'
 	testImplementation 'org.springframework.security:spring-security-test'
+	mockitoAgent('org.mockito:mockito-core') { transitive = false } // 버전은 Spring Boot BOM
 	testCompileOnly 'org.projectlombok:lombok'
 	testRuntimeOnly 'com.h2database:h2'
 	testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
@@ -48,6 +57,7 @@ dependencies {
 
 tasks.named('test') {
 	useJUnitPlatform()
+	jvmArgs += "-javaagent:${configurations.mockitoAgent.asPath}"
 
 	// [부하 테스트 스위치] HotAuctionLoadTest는 평소엔 건너뛴다(수십 초 걸림).
 	// 돌릴 때만: ./gradlew.bat test --tests '*HotAuctionLoadTest*' -Dloadtest=true
