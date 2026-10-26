@@ -6,7 +6,7 @@ Spring Boot 기반 경매 백엔드 API 서버입니다.
 
 ## Tech Stack
 - Runtime: Java 25 (Gradle toolchain)
-- Framework: Spring Boot 4.0.5
+- Framework: Spring Boot 4.1.2
 - Build: Gradle Wrapper
 - Data: Spring Data JPA + MySQL Connector/J
 - Realtime: Spring WebSocket (STOMP 기반 예정)

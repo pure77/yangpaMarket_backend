@@ -1,6 +1,7 @@
 plugins {
 	id 'java'
-	id 'org.springframework.boot' version '4.0.5'
+	// [4.1.2] 4.0의 무료(OSS) 지원이 2026-12-31에 끝난다. 4.1은 2027-07-31까지 지원된다.
+	id 'org.springframework.boot' version '4.1.2'
 	id 'io.spring.dependency-management' version '1.1.7'
 }
 

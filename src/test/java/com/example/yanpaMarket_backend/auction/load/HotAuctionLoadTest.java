@@ -18,9 +18,9 @@ import com.example.yanpaMarket_backend.user.domain.User;
 import com.example.yanpaMarket_backend.user.domain.UserStatus;
 import com.example.yanpaMarket_backend.user.repository.UserRepository;
 import com.example.yanpaMarket_backend.common.cache.CacheNames;
-import com.fasterxml.jackson.databind.JsonNode;
+import tools.jackson.databind.JsonNode;
 import com.github.benmanes.caffeine.cache.stats.CacheStats;
-import com.fasterxml.jackson.databind.ObjectMapper;
+import tools.jackson.databind.ObjectMapper;
 import com.zaxxer.hikari.HikariDataSource;
 import org.apache.tomcat.util.threads.ThreadPoolExecutor;
 import org.springframework.boot.tomcat.TomcatWebServer;
@@ -225,6 +225,7 @@ class HotAuctionLoadTest {
     // broadcast 소요 시간과 "발행 시각"을 얻기 위해 spy로 감싼다. 실제 전송은 그대로 수행된다.
     @MockitoSpyBean SimpMessagingTemplate messagingTemplate;
 
+    // [Jackson 3] Spring Boot 4.1부터 Jackson 2(com.fasterxml)가 기본 의존성에서 빠져 tools.jackson 패키지를 쓴다.
     private final ObjectMapper objectMapper = new ObjectMapper();
     private final HttpClient http = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(5))
