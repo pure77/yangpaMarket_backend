@@ -6,9 +6,14 @@ import com.example.yanpaMarket_backend.auction.domain.Bid;
 import com.example.yanpaMarket_backend.auction.dto.BidHistoryResponse;
 import com.example.yanpaMarket_backend.auction.dto.BidRequest;
 import com.example.yanpaMarket_backend.auction.dto.BidResponse;
+import com.example.yanpaMarket_backend.auction.dto.BidTooLowData;
 import com.example.yanpaMarket_backend.auction.dto.BidUpdateMessage;
+import com.example.yanpaMarket_backend.auction.precheck.BidPriceGuard;
+import com.example.yanpaMarket_backend.auction.precheck.BidPriceSnapshot;
+import com.example.yanpaMarket_backend.auction.precheck.PrecheckResult;
 import com.example.yanpaMarket_backend.auction.repository.AuctionRepository;
 import com.example.yanpaMarket_backend.auction.repository.BidRepository;
+import com.example.yanpaMarket_backend.common.time.AuctionClock;
 import com.example.yanpaMarket_backend.common.util.NicknameMasker;
 import com.example.yanpaMarket_backend.global.error.ApiException;
 import com.example.yanpaMarket_backend.global.error.ErrorCode;
@@ -36,9 +41,10 @@ import org.springframework.transaction.support.TransactionTemplate;
  *
  * placeBid 흐름:
  *  1) 입찰자/경매 식별자 해석(락 밖, 읽기)
+ *  1-1) BidPriceGuard.precheck로 확실히 낮은 입찰은 락 앞에서 거절(Redis, fail-open)
  *  2) BidLock.executeWithLock(auctionId, ...) 안에서 TransactionTemplate으로 짧은 쓰기 트랜잭션 실행
  *       - 경매 재로딩 → Auction.placeBid 검증/갱신 → Bid insert → highestBidId 반영
- *  3) 트랜잭션 정상 커밋 후(executeWithLock 정상 반환 직후) /topic/auction/{publicId}로 BID_UPDATE broadcast
+ *  3) 트랜잭션 커밋 후 BidPriceGuard.record → /topic/auction/{publicId}로 BID_UPDATE broadcast
  *
  * 안전망: 인메모리 락이 실패해 @Version 충돌이 나면 OptimisticLockingFailureException → ALREADY_BIDDING(409).
  *
@@ -72,6 +78,10 @@ public class BidService {
     // [조건] 트랜잭션 매니저가 "정확히 하나"일 때만 자동 등록된다. DB를 2개 이상 써서
     //   매니저가 여러 개가 되면 이 자동 설정이 꺼지므로 @Bean으로 직접 만들거나 @Qualifier로 지정할 것.
     private final TransactionTemplate transactionTemplate;
+    // [판정 시각] 경매 판정 시각은 AuctionClock 한 곳에서 받는다. 서버 증설 시 구현체만 바꾸기 위해서다.
+    private final AuctionClock auctionClock;
+    // [사전 거절] 확실히 무효인 입찰을 락 앞에서 거른다. Redis·키·Lua는 이 인터페이스 뒤에 숨어 있다.
+    private final BidPriceGuard bidPriceGuard;
 
     /** 입찰을 처리하고 커밋 성공 후 BID_UPDATE를 broadcast한다. */
     public BidResponse placeBid(String bidderPublicId, String auctionPublicId, BidRequest request) {
@@ -98,6 +108,20 @@ public class BidService {
         long amount = request.amount();
         String maskedBidder = NicknameMasker.mask(bidder.nickname());
 
+        // [사전 거절 — 락 앞] 부하 테스트에서 요청의 약 92%가 BID_TOO_LOW였고, 그들도 전부 락을 기다린 뒤 거절됐다.
+        //   Redis의 현재가 사본으로 "확실히 낮은" 입찰은 여기서 끝낸다 → 락 대기 0, DB 커넥션 0.
+        //   [의심스러우면 통과] 키가 없거나, Redis가 죽었거나, 종료 시각이 지났으면 Pass → 아래 락 경로가 최종 판정한다.
+        //   [응답 계약 동일] 도메인(Auction.placeBid)이 던지는 것과 같은 에러 코드·data를 쓴다.
+        //   [default 없음] PrecheckResult는 sealed라 결과 종류가 늘면 여기서 컴파일 에러가 난다.
+        switch (bidPriceGuard.precheck(auctionId, bidder.id(), amount, auctionClock.now())) {
+            case PrecheckResult.SelfBid _ -> throw new ApiException(ErrorCode.SELF_BID_NOT_ALLOWED);
+            case PrecheckResult.TooLow tooLow -> throw ApiException.withData(ErrorCode.BID_TOO_LOW,
+                    new BidTooLowData(tooLow.currentPrice(), tooLow.minimumBid()));
+            case PrecheckResult.Pass _ -> {
+                // 락 경로로 진행 — 최종 판정은 락 안 도메인
+            }
+        }
+
         // 락 안에서 [트랜잭션 실행 → 커밋 → broadcast] 까지 처리한다.
         PlacedBid placed;
         try {
@@ -105,6 +129,10 @@ public class BidService {
                 // transactionTemplate.execute()는 커밋까지 끝내고 반환한다. 그 호출이 락 람다 안에 있으므로
                 // 커밋이 락 안에서 일어나고, 다음 스레드는 반드시 반영된 상태를 읽는다.
                 PlacedBid p = transactionTemplate.execute(status -> doPlaceBid(auctionId, bidder.id(), amount));
+                // [현재가 기록 — 커밋 후, 락 안, 브로드캐스트 전]
+                //   커밋 후: 롤백된 입찰이 기록되지 않는다. 락 안: 다음 입찰자의 사전 거절이 최신 현재가를 본다.
+                //   실패해도 예외가 나지 않는다(이미 커밋된 입찰에 실패 응답을 내지 않기 위해 guard가 삼킨다).
+                bidPriceGuard.record(auctionId, p.priceSnapshot());
 
                 // [커밋 후에만 broadcast] 별도 조건문이 없다. 검증 실패로 롤백되거나 @Version 충돌이 나면
                 //   예외가 위로 전파되어 이 줄에 애초에 도달하지 않는다.
@@ -140,7 +168,7 @@ public class BidService {
     private PlacedBid doPlaceBid(Long auctionId, Long bidderUserId, long amount) {
         // [now를 한 번만] isLive/endAt 검증, Bid 생성 시각, remaining 계산이 모두 같은 시각을 써야 한다.
         //   각자 now()를 부르면 "검증은 통과했는데 저장 시각은 종료 후" 같은 모순이 생길 수 있다.
-        LocalDateTime now = LocalDateTime.now();
+        LocalDateTime now = auctionClock.now();
         // 락 안에서 최신 상태 재로딩(낙관적 잠금 버전 포함)
         Auction auction = auctionRepository.findById(auctionId)
                 .orElseThrow(() -> new ApiException(ErrorCode.AUCTION_NOT_FOUND));
@@ -157,8 +185,12 @@ public class BidService {
         // JPA dirty checking이 커밋 시점에 UPDATE를 자동 생성한다.
 
         long remaining = Math.max(0, Duration.between(now, auction.getEndAt()).getSeconds()); // 이미 지난 경우 음수 방지
+        // [기록용 스냅샷] 트랜잭션 안에서 갱신된 엔티티 값으로 만든다(트랜잭션 밖에선 엔티티를 읽지 않는다).
+        BidPriceSnapshot priceSnapshot = new BidPriceSnapshot(
+                auction.getCurrentPrice(), auction.getMinimumBidIncrement(), auction.getSellerUserId(), auction.getEndAt());
         return new PlacedBid(
-                bid.getPublicId(), amount, auction.getCurrentPrice(), auction.getBidCount(), bid.getCreatedAt(), remaining);
+                bid.getPublicId(), amount, auction.getCurrentPrice(), auction.getBidCount(), bid.getCreatedAt(), remaining,
+                priceSnapshot);
     }
 
     /**
@@ -196,6 +228,7 @@ public class BidService {
      *   이 record 하나가 BidResponse(REST)와 BidUpdateMessage(WS) 둘 다의 재료가 된다.
      */
     private record PlacedBid(
-            String bidPublicId, long amount, long currentPrice, int bidCount, LocalDateTime createdAt, long remainingTime) {
+            String bidPublicId, long amount, long currentPrice, int bidCount, LocalDateTime createdAt, long remainingTime,
+            BidPriceSnapshot priceSnapshot) {
     }
 }

@@ -124,6 +124,21 @@ class AuctionTest {
                 .isEqualTo(com.example.yanpaMarket_backend.global.error.ErrorCode.SELF_BID_NOT_ALLOWED);
     }
 
+    /** 판매자가 낮은 금액으로 입찰해도 BID_TOO_LOW가 아니라 SELF_BID_NOT_ALLOWED — 검증 순서 고정. */
+    @org.junit.jupiter.api.Test
+    void placeBid는_판매자의_낮은_입찰도_SELF_BID_NOT_ALLOWED() {
+        LocalDateTime now = LocalDateTime.now();
+        Auction auction = newActiveAuction(now.minusMinutes(1)); // sellerUserId = 1L
+
+        Throwable thrown = org.assertj.core.api.Assertions.catchThrowable(() -> auction.placeBid(1L, 1L, now));
+
+        org.assertj.core.api.Assertions.assertThat(thrown)
+                .isInstanceOf(com.example.yanpaMarket_backend.global.error.ApiException.class);
+        org.assertj.core.api.Assertions.assertThat(
+                        ((com.example.yanpaMarket_backend.global.error.ApiException) thrown).getErrorCode())
+                .isEqualTo(com.example.yanpaMarket_backend.global.error.ErrorCode.SELF_BID_NOT_ALLOWED);
+    }
+
     @org.junit.jupiter.api.Test
     void placeBid는_종료시각이_지났으면_AUCTION_ENDED() {
         LocalDateTime now = LocalDateTime.now();

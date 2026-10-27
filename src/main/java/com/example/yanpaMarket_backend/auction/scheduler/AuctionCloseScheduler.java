@@ -2,7 +2,7 @@ package com.example.yanpaMarket_backend.auction.scheduler;
 
 import com.example.yanpaMarket_backend.auction.service.AuctionCloseService;
 import com.example.yanpaMarket_backend.auction.service.AuctionCloseService.CloseResult;
-import java.time.LocalDateTime;
+import com.example.yanpaMarket_backend.common.time.AuctionClock;
 import java.util.List;
 import lombok.RequiredArgsConstructor;
 import org.springframework.messaging.simp.SimpMessagingTemplate;
@@ -53,6 +53,8 @@ public class AuctionCloseScheduler {
 
     private final AuctionCloseService auctionCloseService;
     private final SimpMessagingTemplate messagingTemplate;
+    // [판정 시각] 경매 판정 시각은 AuctionClock 한 곳에서 받는다. 서버 증설 시 구현체만 바꾸기 위해서다.
+    private final AuctionClock auctionClock;
 
     /**
      * [왜 fixedDelay인가 — fixedRate와의 차이]
@@ -86,7 +88,7 @@ public class AuctionCloseScheduler {
         //   아래처럼 별도 빈으로 분리하면 주입받은 auctionCloseService가 "프록시"이므로
         //   외부 호출이 되어 트랜잭션이 정상적으로 열린다. 구조적으로 실수할 수 없다.
         //   (BidService는 순서 제어까지 필요해 TransactionTemplate을 썼다 — 같은 문제, 다른 해법)
-        List<CloseResult> results = auctionCloseService.closeExpiredWithDestination(LocalDateTime.now());
+        List<CloseResult> results = auctionCloseService.closeExpiredWithDestination(auctionClock.now());
         // [커밋 후 broadcast] 위 메서드가 "반환된 시점 = 커밋 완료"다.
         //   롤백되면 예외가 전파되어 이 루프에 도달하지 않는다. BidService와 동일한 원칙.
         for (CloseResult result : results) {
