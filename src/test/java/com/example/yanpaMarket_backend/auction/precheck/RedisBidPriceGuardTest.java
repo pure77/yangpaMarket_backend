@@ -113,6 +113,27 @@ class RedisBidPriceGuardTest extends RedisTestSupport {
     }
 
     @Test
+    void 저장된_price가_숫자가_아니어도_다음_기록이_덮어써서_복구한다() {
+        // [왜] Lua가 비숫자 price에서 에러를 내면 만료까지 모든 record가 실패한다(spec 7-4: 다음 성공 입찰이 바로잡는다).
+        redis.opsForHash().put(KEY, BidRedisKeys.PRICE, "abc");
+        long expected = AuctionTimes.toEpochMillis(END) + RedisBidPriceGuard.KEY_GRACE.toMillis();
+        RedisScript<Long> pexpiretime = RedisScript.of("return redis.call('PEXPIRETIME', KEYS[1])", Long.class);
+
+        recordPrice(100_000L);
+
+        assertThat(redis.opsForHash().get(KEY, BidRedisKeys.PRICE)).isEqualTo("100000");
+        assertThat(guard.stats().recordFailures()).isZero();
+        assertThat(redis.execute(pexpiretime, List.of(KEY))).isEqualTo(expected);
+    }
+
+    @Test
+    void 같은_가격_기록은_무시된다_경계() {
+        recordPrice(100_000L);
+        guard.record(AUCTION, new BidPriceSnapshot(100_000L, 20_000L, SELLER, END));
+        assertThat(redis.opsForHash().get(KEY, BidRedisKeys.INC)).isEqualTo("10000");
+    }
+
+    @Test
     void evict는_키를_지운다() {
         recordPrice(100_000L);
         guard.evict(AUCTION);

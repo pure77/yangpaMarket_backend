@@ -88,11 +88,11 @@ public abstract class RedisTestSupport {
         return shared;
     }
 
-    /** 운영과 같은 ClientOptions(RedisConfig.clientOptions)로 독립 연결을 만든다. 다 쓰면 close로 닫는다. */
+    /** 운영과 같은 ClientOptions(RedisConfig.testClientOptions = Boot 기본 + 가드 옵션)로 독립 연결을 만든다. 다 쓰면 close로 닫는다. */
     protected static StringRedisTemplate newRedisTemplate(String host, int port, Duration commandTimeout) {
         LettuceClientConfiguration client = LettuceClientConfiguration.builder()
                 .commandTimeout(commandTimeout)
-                .clientOptions(RedisConfig.clientOptions(Duration.ofMillis(200)))
+                .clientOptions(RedisConfig.testClientOptions(Duration.ofMillis(200)))
                 .build();
         LettuceConnectionFactory factory = new LettuceConnectionFactory(new RedisStandaloneConfiguration(host, port), client);
         factory.afterPropertiesSet();

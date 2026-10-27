@@ -4,7 +4,9 @@
 -- KEYS[1] = auction:{id}:bid
 -- ARGV    = price, inc, seller, endAtMs, expireAtMs(endAt + 1시간)
 local cur = redis.call('HGET', KEYS[1], 'price')
-if cur and tonumber(cur) >= tonumber(ARGV[1]) then
+-- [손상값 자가 복구] 저장된 price가 숫자가 아니면 tonumber가 nil이라 비교를 건너뛰고 덮어쓴다(에러로 막히지 않게)
+local n = tonumber(cur)
+if n and n >= tonumber(ARGV[1]) then
   return 0  -- [단조 증가 가드] 같거나 작으면 무시: 서버 간 기록 순서가 뒤바뀌어도 현재가가 내려가지 않는다
 end
 -- [항상 네 필드를 한꺼번에] 일부 필드만 있는 해시가 생기지 않는다

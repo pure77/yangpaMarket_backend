@@ -307,13 +307,15 @@ public class Auction extends BaseTimeEntity {
         // [규칙 ② 본인 입찰, ③ 최소 인상폭] 판정은 BidRules가 한다 — Redis 사전 거절과 같은 함수를 쓰기 위해서다.
         //   여기서는 판정 결과를 예외로 바꾸기만 한다. 응답 코드·data 형식은 이전과 같다.
         //   [거절에 숫자를 싣는다] 클라이언트가 "얼마여야 하는지"를 알아야 재시도가 추측이 아니게 된다.
-        switch (BidRules.check(sellerUserId, bidderUserId, amount, currentPrice, minimumBidIncrement)) {
-            case SELF_BID -> throw new ApiException(ErrorCode.SELF_BID_NOT_ALLOWED);
-            case TOO_LOW -> throw ApiException.withData(ErrorCode.BID_TOO_LOW,
+        //   [default 없음] switch 표현식이라 Verdict가 늘었는데 여기를 빠뜨리면 컴파일 에러가 난다(조용히 입찰이 통과되는 것 방지).
+        ApiException rejection = switch (BidRules.check(sellerUserId, bidderUserId, amount, currentPrice, minimumBidIncrement)) {
+            case SELF_BID -> new ApiException(ErrorCode.SELF_BID_NOT_ALLOWED);
+            case TOO_LOW -> ApiException.withData(ErrorCode.BID_TOO_LOW,
                     new BidTooLowData(currentPrice, currentPrice + minimumBidIncrement));
-            case OK -> {
-                // 통과
-            }
+            case OK -> null;
+        };
+        if (rejection != null) {
+            throw rejection;
         }
         // 통과 시 딱 두 값만 갱신한다. highestBidId는 Bid가 아직 저장 전이라 PK가 없어 건드릴 수 없다.
         this.currentPrice = amount;
