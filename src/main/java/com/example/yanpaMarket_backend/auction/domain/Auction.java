@@ -304,24 +304,16 @@ public class Auction extends BaseTimeEntity {
         if (!isLive(now) || !endAt.isAfter(now)) {
             throw new ApiException(ErrorCode.AUCTION_ENDED);
         }
-        // [규칙 ②] 본인 입찰 금지 — 자기 물건 값을 인위적으로 올리는 자전거래(shill bidding) 방지.
-        //   [== 대신 equals인 이유] Long은 객체라 ==는 참조 비교다. 자바는 -128~127만 캐싱하므로
-        //   테스트 데이터(작은 ID)에서는 우연히 통과하고 실서비스 ID에서만 조용히 뚫린다.
-        //   null이 아닌 sellerUserId(nullable=false)를 앞에 둔 것도 방어적 습관.
-        //   [한계] 부계정을 만들면 우회된다. 근본 방어가 아니라 최소 방어선이다.
-        if (sellerUserId.equals(bidderUserId)) {
-            throw new ApiException(ErrorCode.SELF_BID_NOT_ALLOWED);
-        }
-        // [규칙 ③] 최소 입찰 단위 — "현재가보다 크면 통과"가 아니라 "현재가 + 인상폭 이상"이어야 한다.
-        //   1원씩 올리는 눈치싸움(nibbling)을 막는다. 그대로 두면 입찰이 수천 건 쌓이고
-        //   WebSocket broadcast도 그만큼 나가 성능과 UX가 동시에 나빠진다.
-        //   [왜 상수가 아니라 필드인가] 경매별로 다르게 설정할 여지를 남긴 것.
-        //   "시작가의 5%" 같은 정책이 생겨도 스키마 변경 없이 코드만 바꾸면 된다.
+        // [규칙 ② 본인 입찰, ③ 최소 인상폭] 판정은 BidRules가 한다 — Redis 사전 거절과 같은 함수를 쓰기 위해서다.
+        //   여기서는 판정 결과를 예외로 바꾸기만 한다. 응답 코드·data 형식은 이전과 같다.
         //   [거절에 숫자를 싣는다] 클라이언트가 "얼마여야 하는지"를 알아야 재시도가 추측이 아니게 된다.
-        //   경합 구간에서는 응답을 기다리는 사이 현재가가 올라 대부분의 입찰이 여기서 걸린다.
-        if (amount < currentPrice + minimumBidIncrement) {
-            throw ApiException.withData(ErrorCode.BID_TOO_LOW,
+        switch (BidRules.check(sellerUserId, bidderUserId, amount, currentPrice, minimumBidIncrement)) {
+            case SELF_BID -> throw new ApiException(ErrorCode.SELF_BID_NOT_ALLOWED);
+            case TOO_LOW -> throw ApiException.withData(ErrorCode.BID_TOO_LOW,
                     new BidTooLowData(currentPrice, currentPrice + minimumBidIncrement));
+            case OK -> {
+                // 통과
+            }
         }
         // 통과 시 딱 두 값만 갱신한다. highestBidId는 Bid가 아직 저장 전이라 PK가 없어 건드릴 수 없다.
         this.currentPrice = amount;
