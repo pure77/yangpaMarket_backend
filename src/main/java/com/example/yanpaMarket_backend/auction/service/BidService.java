@@ -9,6 +9,7 @@ import com.example.yanpaMarket_backend.auction.dto.BidResponse;
 import com.example.yanpaMarket_backend.auction.dto.BidUpdateMessage;
 import com.example.yanpaMarket_backend.auction.repository.AuctionRepository;
 import com.example.yanpaMarket_backend.auction.repository.BidRepository;
+import com.example.yanpaMarket_backend.common.time.AuctionClock;
 import com.example.yanpaMarket_backend.common.util.NicknameMasker;
 import com.example.yanpaMarket_backend.global.error.ApiException;
 import com.example.yanpaMarket_backend.global.error.ErrorCode;
@@ -72,6 +73,8 @@ public class BidService {
     // [조건] 트랜잭션 매니저가 "정확히 하나"일 때만 자동 등록된다. DB를 2개 이상 써서
     //   매니저가 여러 개가 되면 이 자동 설정이 꺼지므로 @Bean으로 직접 만들거나 @Qualifier로 지정할 것.
     private final TransactionTemplate transactionTemplate;
+    // [판정 시각] 경매 판정 시각은 AuctionClock 한 곳에서 받는다. 서버 증설 시 구현체만 바꾸기 위해서다.
+    private final AuctionClock auctionClock;
 
     /** 입찰을 처리하고 커밋 성공 후 BID_UPDATE를 broadcast한다. */
     public BidResponse placeBid(String bidderPublicId, String auctionPublicId, BidRequest request) {
@@ -140,7 +143,7 @@ public class BidService {
     private PlacedBid doPlaceBid(Long auctionId, Long bidderUserId, long amount) {
         // [now를 한 번만] isLive/endAt 검증, Bid 생성 시각, remaining 계산이 모두 같은 시각을 써야 한다.
         //   각자 now()를 부르면 "검증은 통과했는데 저장 시각은 종료 후" 같은 모순이 생길 수 있다.
-        LocalDateTime now = LocalDateTime.now();
+        LocalDateTime now = auctionClock.now();
         // 락 안에서 최신 상태 재로딩(낙관적 잠금 버전 포함)
         Auction auction = auctionRepository.findById(auctionId)
                 .orElseThrow(() -> new ApiException(ErrorCode.AUCTION_NOT_FOUND));

@@ -12,6 +12,7 @@ import com.example.yanpaMarket_backend.auction.dto.AuctionSummaryResponse;
 import com.example.yanpaMarket_backend.auction.dto.AuctionUpdateRequest;
 import com.example.yanpaMarket_backend.auction.repository.AuctionImageRepository;
 import com.example.yanpaMarket_backend.auction.repository.AuctionRepository;
+import com.example.yanpaMarket_backend.common.time.AuctionClock;
 import com.example.yanpaMarket_backend.common.util.PublicIdGenerator;
 import com.example.yanpaMarket_backend.global.error.ApiException;
 import com.example.yanpaMarket_backend.global.error.ErrorCode;
@@ -61,6 +62,8 @@ public class AuctionService {
     private final AuctionImageRepository auctionImageRepository;
     private final ImageRepository imageRepository;
     private final UserRepository userRepository;
+    // [판정 시각] 경매 판정 시각은 AuctionClock 한 곳에서 받는다. 서버 증설 시 구현체만 바꾸기 위해서다.
+    private final AuctionClock auctionClock;
 
     // application.properties: app.auction.publish-delay-seconds=10 (기본값 10초, 테스트용)
     @Value("${app.auction.publish-delay-seconds:10}")
@@ -73,7 +76,7 @@ public class AuctionService {
     @Transactional
     public AuctionCreateResponse create(String sellerPublicId, AuctionCreateRequest request) {
         User seller = getUserOrUnauthorized(sellerPublicId);
-        LocalDateTime now = LocalDateTime.now();
+        LocalDateTime now = auctionClock.now();
 
         Auction auction = Auction.builder()
                 .publicId(PublicIdGenerator.newUlid())
@@ -101,7 +104,7 @@ public class AuctionService {
             AuctionCategory category, String keyword, Pageable pageable) {
         String normalizedKeyword = (keyword == null || keyword.isBlank()) ? null : keyword;
         Page<Auction> page = auctionRepository.findPublicList(
-                AuctionStatus.ACTIVE, LocalDateTime.now(), category, normalizedKeyword, pageable);
+                AuctionStatus.ACTIVE, auctionClock.now(), category, normalizedKeyword, pageable);
         Page<AuctionSummaryResponse> mapped = page.map(
                 auction -> AuctionSummaryResponse.from(auction, primaryImageUrl(auction), null));
         return AuctionListResponse.from(mapped);
@@ -156,7 +159,7 @@ public class AuctionService {
                 request.condition(), request.startPrice(), request.buyNowPrice(), request.endTime());
 
         // 아직 공개 전인 경매를 수정하면 공개 유예를 수정 시점 기준으로 다시 부여한다
-        LocalDateTime now = LocalDateTime.now();
+        LocalDateTime now = auctionClock.now();
         if (auction.getStartAt().isAfter(now)) {
             auction.reschedulePublishAt(now.plusSeconds(publishDelaySeconds));
         }
