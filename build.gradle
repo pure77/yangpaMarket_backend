@@ -69,8 +69,9 @@ tasks.named('test') {
 	// 파라미터도 같은 방식으로 넘긴다: -Dload.subscribers=100 -Dload.bidders=20 -Dload.seconds=60
 	// load.auctions(인기 경매 수) / load.auctionSweep(경매 수 스윕, 예: 1,3,5)도 같은 방식.
 	// load.bidders / load.subscribers 는 "경매당" 값이다.
+	// load.precheck=on|off(기본 off): 입찰 사전 거절(Redis) A/B 비교. on이면 docker-compose Redis의 DB 15를 비우고 쓴다.
 	['loadtest', 'load.profile', 'load.subscribers', 'load.bidders', 'load.seconds', 'load.thinkMillis',
-	 'load.poolSize', 'load.sweep', 'load.auctions', 'load.auctionSweep'].each { key ->
+	 'load.poolSize', 'load.sweep', 'load.auctions', 'load.auctionSweep', 'load.precheck'].each { key ->
 		if (System.getProperty(key) != null) {
 			systemProperty key, System.getProperty(key)
 		}

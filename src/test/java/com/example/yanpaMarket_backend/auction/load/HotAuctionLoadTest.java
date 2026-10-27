@@ -26,6 +26,16 @@ import org.apache.tomcat.util.threads.ThreadPoolExecutor;
 import org.springframework.boot.tomcat.TomcatWebServer;
 import org.springframework.boot.web.server.WebServer;
 import org.springframework.boot.web.server.context.WebServerApplicationContext;
+import com.example.yanpaMarket_backend.auction.precheck.BidPriceGuard;
+import com.example.yanpaMarket_backend.auction.precheck.BidRedisKeys;
+import com.example.yanpaMarket_backend.auction.precheck.GuardStats;
+import com.example.yanpaMarket_backend.auction.precheck.NoOpBidPriceGuard;
+import com.example.yanpaMarket_backend.auction.precheck.RedisBidPriceGuard;
+import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.data.redis.connection.RedisConnectionFactory;
+import org.springframework.data.redis.connection.lettuce.LettuceConnectionFactory;
+import org.springframework.data.redis.core.RedisCallback;
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.cache.Cache;
 import org.springframework.cache.CacheManager;
 import org.springframework.cache.caffeine.CaffeineCache;
@@ -183,6 +193,24 @@ class HotAuctionLoadTest {
         registry.add("spring.datasource.url", () -> toLoadTestUrl(devUrl));
     }
 
+    /** -Dload.precheck=on 이면 사전 거절(Redis)을 켠다. 기본 off — 예전 명령은 예전과 같은 조건으로 돈다. */
+    static boolean precheckOn() {
+        return "on".equals(System.getProperty("load.precheck", "off"));
+    }
+
+    /**
+     * [부하 테스트 전용 Redis DB 15] docker-compose Redis를 그대로 쓰되 DB 번호만 분리한다(MySQL _loadtest와 같은 발상).
+     *   H2/MySQL을 create-drop하면 경매 PK가 재사용되는데, 앞 실행의 auction:{1}:bid가 남아 있으면 거짓 거절이 난다.
+     *   그래서 시작할 때 DB 15를 비운다(prepareRedis). 개발용 DB 0은 건드리지 않는다.
+     */
+    static final int LOAD_REDIS_DATABASE = 15;
+
+    @DynamicPropertySource
+    static void configurePrecheck(DynamicPropertyRegistry registry) {
+        registry.add("app.bid.precheck.enabled", () -> String.valueOf(precheckOn()));
+        registry.add("spring.data.redis.database", () -> String.valueOf(LOAD_REDIS_DATABASE));
+    }
+
     /** "jdbc:mysql://host:port/db?params" → "jdbc:mysql://host:port/db_loadtest?params+자동생성" */
     static String toLoadTestUrl(String devUrl) {
         int queryAt = devUrl.indexOf('?');
@@ -221,6 +249,10 @@ class HotAuctionLoadTest {
     @Autowired CacheManager cacheManager;
     // Tomcat 요청 스레드풀을 꺼내기 위한 컨텍스트(WebServerApplicationContext로 내장 서버를 얻는다)
     @Autowired ApplicationContext applicationContext;
+    // [사전 거절 A/B] on일 때만 RedisBidPriceGuard가 있다. 카운터([사전 거절] 섹션)와 Redis 정합성 확인에 쓴다.
+    @Autowired ObjectProvider<RedisBidPriceGuard> redisGuard;
+    @Autowired StringRedisTemplate redisTemplate;
+    @Autowired RedisConnectionFactory redisConnectionFactory;
 
     // broadcast 소요 시간과 "발행 시각"을 얻기 위해 spy로 감싼다. 실제 전송은 그대로 수행된다.
     @MockitoSpyBean SimpMessagingTemplate messagingTemplate;
@@ -247,6 +279,19 @@ class HotAuctionLoadTest {
         @Primary
         BidLock timingBidLock(InMemoryBidLock delegate) {
             return new TimingBidLock(delegate);
+        }
+
+        /**
+         * 사전 거절을 측정용 데코레이터로 감싼다. @Primary라 BidService·AuctionService가 이 빈을 받는다.
+         * on이면 RedisBidPriceGuard, off면 NoOpBidPriceGuard에 위임한다.
+         */
+        @Bean
+        @Primary
+        BidPriceGuard timingBidPriceGuard(ObjectProvider<RedisBidPriceGuard> redis,
+                                          ObjectProvider<NoOpBidPriceGuard> noOp) {
+            // (브리프의 getIfAvailable(noOp::getObject)는 타입이 달라 컴파일되지 않아 명시적으로 분기한다)
+            BidPriceGuard real = redis.getIfAvailable();
+            return new TimingBidPriceGuard(real != null ? real : noOp.getObject());
         }
 
         /**
@@ -279,6 +324,9 @@ class HotAuctionLoadTest {
         final LoadSamples transactionSuccess = new LoadSamples();
         final LoadSamples broadcast = new LoadSamples();       // (d)
         final LoadSamples responseTime = new LoadSamples();    // 입찰 API 응답 (입찰 스레드 측정)
+        final LoadSamples precheck = new LoadSamples();          // (p) 사전 거절 (Redis 왕복 포함)
+        final LoadSamples responseSuccess = new LoadSamples();   // 입찰 API 응답 — 201만
+        final LoadSamples responseRejected = new LoadSamples();  // 입찰 API 응답 — 400만
         final LoadSamples propagation = new LoadSamples();     // POST 전송 → 구독자 수신
         final LoadSamples fanout = new LoadSamples();          // (f) 발행 → 구독자 수신
 
@@ -348,6 +396,7 @@ class HotAuctionLoadTest {
 
         /** 스윕 모드에서 구간마다 처음부터 다시 재기 위해 전부 비운다. latestPrice는 경매가 이어지므로 남긴다. */
         void reset() {
+            precheck.reset(); responseSuccess.reset(); responseRejected.reset();
             serverHandling.reset(); entry.reset(); lockWait.reset(); lockHold.reset();
             transaction.reset(); broadcast.reset(); responseTime.reset(); propagation.reset(); fanout.reset();
             lockHoldSuccess.reset(); transactionSuccess.reset();
@@ -393,7 +442,8 @@ class HotAuctionLoadTest {
     }
 
     /** 경매 한 건의 정합성 점검 재료. bidCount 증가분 == 그 경매의 201 응답 수여야 한다. */
-    record AuctionCheck(int index, String publicId, int bidCountDelta, int created, long persistedBids) {
+    record AuctionCheck(int index, String publicId, int bidCountDelta, int created, long persistedBids,
+                        long dbPrice, Long redisPrice) {
     }
 
     /**
@@ -415,9 +465,42 @@ class HotAuctionLoadTest {
         }
     }
 
+    /**
+     * [안전장치] on일 때 DB 15인지 확인한 뒤 비운다. 다른 DB 번호면 아무것도 지우지 않고 즉시 실패시킨다.
+     */
+    private void prepareRedis() {
+        if (!precheckOn()) {
+            return;
+        }
+        int database = ((LettuceConnectionFactory) redisConnectionFactory).getDatabase();
+        if (database != LOAD_REDIS_DATABASE) {
+            throw new IllegalStateException("부하 테스트는 Redis DB " + LOAD_REDIS_DATABASE
+                    + "에서만 실행할 수 있습니다. 현재 DB: " + database);
+        }
+        redisTemplate.execute((RedisCallback<Object>) connection -> {
+            connection.serverCommands().flushDb();
+            return null;
+        });
+    }
+
+    private GuardStats guardStats() {
+        RedisBidPriceGuard guard = redisGuard.getIfAvailable();
+        return guard == null ? null : guard.stats();
+    }
+
+    /** 경매의 Redis 현재가 사본. off이거나 키가 없으면 null. */
+    private Long redisPrice(Long auctionId) {
+        if (!precheckOn()) {
+            return null;
+        }
+        Object value = redisTemplate.opsForHash().get(BidRedisKeys.bid(auctionId), BidRedisKeys.PRICE);
+        return value == null ? null : Long.valueOf((String) value);
+    }
+
     @Test
     void 인기_경매_입찰_폭주_부하() throws Exception {
         assertSafeDatabase();
+        prepareRedis();
 
         // ── 준비: 판매자 1명, 경매 최대 K건, 입찰자 (K × 경매당 최대 M)명 ─────────────
         cleanUp();
@@ -518,7 +601,10 @@ class HotAuctionLoadTest {
                 HikariDataSource hikari = unwrapHikari();
                 ThreadPoolExecutor tomcatPool = unwrapTomcatExecutor();
                 Thread poolSampler = startPoolSampler(hikari, tomcatPool);
+                GuardStats guardBefore = guardStats();
                 long wallNanos = runBiddingPhase(activeIds, tokensByAuction, phaseBidders);
+                GuardStats guardAfter = guardStats();
+                GuardStats guardDelta = guardAfter == null ? null : guardAfter.minus(guardBefore);
                 CacheDeltas cacheDeltas = new CacheDeltas(
                         cacheDelta(auctionCacheBefore, CacheNames.AUCTION_ID_BY_PUBLIC_ID),
                         cacheDelta(userCacheBefore, CacheNames.USER_SUMMARY_BY_PUBLIC_ID));
@@ -536,12 +622,14 @@ class HotAuctionLoadTest {
                             reloaded.getId(), org.springframework.data.domain.PageRequest.of(0, 1)).getTotalElements();
                     AtomicInteger success = metrics.successByAuction.get(id);
                     checks.add(new AuctionCheck(a + 1, id, reloaded.getBidCount() - bidCountBefore.get(id),
-                            success == null ? 0 : success.get(), persistedBids));
+                            success == null ? 0 : success.get(), persistedBids,
+                            reloaded.getCurrentPrice(), redisPrice(reloaded.getId())));
                 }
 
-                String report = buildReport(checks, wallNanos, hikari, tomcatPool, phaseAuctions, phaseBidders, sessions.size(), cacheDeltas);
+                String report = buildReport(checks, wallNanos, hikari, tomcatPool, phaseAuctions, phaseBidders, sessions.size(), cacheDeltas, guardDelta);
                 System.out.println(report);
-                writeReport(report, "auctions" + phaseAuctions + "-bidders" + phaseBidders);
+                writeReport(report, "auctions" + phaseAuctions + "-bidders" + phaseBidders
+                        + "-precheck-" + (precheckOn() ? "on" : "off"));
                 results.add(snapshot(phaseAuctions, phaseBidders, wallNanos, cacheDeltas));
             }
         }
@@ -694,10 +782,12 @@ class HotAuctionLoadTest {
                     .POST(HttpRequest.BodyPublishers.ofString("{\"amount\":" + amount + "}"))
                     .build();
             HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString());
-            metrics.responseTime.add(System.nanoTime() - start);
+            long elapsed = System.nanoTime() - start;
+            metrics.responseTime.add(elapsed);
 
             switch (response.statusCode()) {
                 case 201 -> {
+                    metrics.responseSuccess.add(elapsed);
                     metrics.created201.incrementAndGet();
                     metrics.successByAuction.computeIfAbsent(auctionPublicId, k -> new AtomicInteger())
                             .incrementAndGet();
@@ -710,7 +800,10 @@ class HotAuctionLoadTest {
                 //   생성기는 이미 현재가를 알고 있다. 거절 응답이 새로 주는 정보가 없다.
                 //   거절의 원인은 정보 부족이 아니라 여러 스레드가 같은 latestPrice로 동시에
                 //   같은 금액을 만들어 던지는 것이다 — 정보를 아무리 신선하게 줘도 안 바뀐다.
-                case 400 -> metrics.tooLow400.incrementAndGet();  // BID_TOO_LOW — 경합에서 밀림(정상)
+                case 400 -> { // BID_TOO_LOW — 경합에서 밀림(정상)
+                    metrics.tooLow400.incrementAndGet();
+                    metrics.responseRejected.add(elapsed);
+                }
                 case 409 -> metrics.conflict409.incrementAndGet(); // 락이 뚫린 신호
                 case 500 -> metrics.serverError500.incrementAndGet();
                 default -> metrics.otherStatus.incrementAndGet();
@@ -856,6 +949,22 @@ class HotAuctionLoadTest {
         return cacheLine("경매 ID    ", deltas.auctionId()) + cacheLine("사용자 요약", deltas.userSummary());
     }
 
+    /**
+     * [사전 거절] 섹션. 읽는 법: "락 앞 거절 비율"이 높을수록 거절이 락·DB를 쓰지 않고 끝났다는 뜻이다.
+     *   거절 응답 p95([응답] └ 거절)와 pending([DB])이 off 대비 줄었는지 함께 본다.
+     */
+    private String precheckSection(GuardStats d, int rejected400) {
+        if (d == null) {
+            return String.format("  꺼짐 (-Dload.precheck=on 으로 켠다)%n");
+        }
+        double share = rejected400 > 0 ? d.precheckTooLow() * 100.0 / rejected400 : 0;
+        return String.format("  판정      통과 %,d   TooLow %,d   SelfBid %,d   실패 %,d%n",
+                d.precheckPass(), d.precheckTooLow(), d.precheckSelfBid(), d.precheckFailures())
+                + String.format("  락 앞 거절 비율  %.0f%%  (BID_TOO_LOW %,d건 중 %,d건)   목표 80%% 이상  %s%n",
+                share, rejected400, d.precheckTooLow(), share >= 80 ? "OK" : "확인 필요")
+                + String.format("  record 실패 %,d   evict 실패 %,d%n", d.recordFailures(), d.evictFailures());
+    }
+
     private String cacheLine(String label, CacheStats stats) {
         if (stats == null) {
             return String.format("  %s (캐시 통계를 읽을 수 없음)%n", label);
@@ -871,7 +980,7 @@ class HotAuctionLoadTest {
      */
     private String buildReport(List<AuctionCheck> checks, long wallNanos, HikariDataSource hikari,
                                ThreadPoolExecutor tomcatPool, int phaseAuctions, int phaseBidders, int totalSessions,
-                               CacheDeltas cacheDeltas) {
+                               CacheDeltas cacheDeltas, GuardStats guardDelta) {
         double wallSeconds = wallNanos / 1_000_000_000.0;
 
         // 입찰 스레드 측정 — POST 보내고 답 받기까지
@@ -892,6 +1001,8 @@ class HotAuctionLoadTest {
         double txP95 = metrics.transaction.percentileMillis(0.95);
         double castP50 = metrics.broadcast.percentileMillis(0.50);
         double castP95 = metrics.broadcast.percentileMillis(0.95);
+        double preP50 = metrics.precheck.percentileMillis(0.50);
+        double preP95 = metrics.precheck.percentileMillis(0.95);
 
         // [Tomcat 포화] busy가 maxThreads에 붙은 샘플 비율. 20%를 넘으면 요청이 필터 도달 전에 대기열에서 기다린 것.
         //   이 대기는 ServerTimingFilter 밖이라 아래 "필터 밖" 몫에 섞여 들어간다.
@@ -947,6 +1058,10 @@ class HotAuctionLoadTest {
         sb.append(String.format("%n[응답]%n"));
         sb.append(String.format("  입찰 API 응답        p50 %6.1fms   p95 %6.1fms   p99 %6.1fms%n",
                 respP50, respP95, respP99));
+        sb.append(String.format("    ├ 성공(201)        p50 %6.1fms   p95 %6.1fms%n",
+                metrics.responseSuccess.percentileMillis(0.50), metrics.responseSuccess.percentileMillis(0.95)));
+        sb.append(String.format("    └ 거절(400)        p50 %6.1fms   p95 %6.1fms%n",
+                metrics.responseRejected.percentileMillis(0.50), metrics.responseRejected.percentileMillis(0.95)));
         sb.append(String.format("  전체 요청 처리량     ~ %.1f req/sec   (201+400+409+500 = %,d건 / %.1f초)%n",
                 requestsPerSec, totalRequests, wallSeconds));
         sb.append(String.format("  전파 지연            p50 %6.1fms   p95 %6.1fms   p99 %6.1fms    목표 p95 < 1000ms  %s%n",
@@ -954,6 +1069,7 @@ class HotAuctionLoadTest {
 
         sb.append(String.format("%n[구간 분해] (p50 / p95, 비율은 서버 처리 p95 기준 — 요청별 측정)%n"));
         sb.append(String.format("  %-26s %6.1fms / %6.1fms%n", "서버 처리 합계", srvP50, srvP95));
+        sb.append(segment("  (p) 사전 거절", preP50, preP95, srvP95));
         sb.append(segment("  (a) 진입·조회", entryP50, entryP95, srvP95));
         sb.append(segment("  (b) 락 대기", waitP50, waitP95, srvP95));
         sb.append(segment("  (c) 트랜잭션", txP50, txP95, srvP95));
@@ -994,6 +1110,8 @@ class HotAuctionLoadTest {
         sb.append(poolSection(hikari));
         sb.append(String.format("%n[캐시]%n"));
         sb.append(cacheSection(cacheDeltas));
+        sb.append(String.format("%n[사전 거절]%n"));
+        sb.append(precheckSection(guardDelta, rejected));
         sb.append(String.format("%n[Tomcat]%n"));
         sb.append(tomcatSection(tomcatPool));
 
@@ -1036,6 +1154,14 @@ class HotAuctionLoadTest {
             sb.append(String.format("  경매 %-3d  bidCount 증가 %d == 201응답 %d  %s   (누적 bids행 %d)%n",
                     c.index(), c.bidCountDelta(), c.created(),
                     c.bidCountDelta() == c.created() ? "OK" : "FAIL", c.persistedBids()));
+        }
+        if (precheckOn()) {
+            for (AuctionCheck c : checks) {
+                boolean match = c.redisPrice() != null && c.redisPrice() == c.dbPrice();
+                sb.append(String.format("  경매 %-3d  Redis 현재가 %s == DB 현재가 %,d  %s%n",
+                        c.index(), c.redisPrice() == null ? "(키 없음)" : String.format("%,d", c.redisPrice()),
+                        c.dbPrice(), match ? "OK" : "FAIL"));
+            }
         }
 
         sb.append(String.format("%n[판정 힌트] %s%n",

@@ -59,15 +59,18 @@ final class ServerTimingFilter extends OncePerRequestFilter implements Ordered {
             long wait = slot[RequestTiming.WAIT];
             long hold = slot[RequestTiming.HOLD];
             long broadcast = slot[RequestTiming.BROADCAST];
+            long precheck = slot[RequestTiming.PRECHECK];
 
             metrics.serverHandling.add(serverTotal);
             metrics.lockWait.add(wait);
             metrics.lockHold.add(hold);
             metrics.broadcast.add(broadcast);
+            metrics.precheck.add(precheck);
             // 요청별 정확한 뺄셈 — 백분위 뺄셈이 아니다
             long tx = Math.max(0, hold - broadcast);
             metrics.transaction.add(tx);
-            metrics.entry.add(Math.max(0, serverTotal - wait - hold));
+            // (a) 진입·조회 = 서버 전체 - 사전 거절 - 락 대기 - 락 보유 (사전 거절은 (p)로 따로 본다)
+            metrics.entry.add(Math.max(0, serverTotal - precheck - wait - hold));
 
             // [성공만 따로 기록하는 이유]
             //   거절(BID_TOO_LOW)은 락 안에서 SELECT 하나 하고 예외를 던지고 끝나 매우 빠르다.

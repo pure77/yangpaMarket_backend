@@ -14,18 +14,19 @@ package com.example.yanpaMarket_backend.auction.load;
  *   입찰은 전부 HTTP POST라 모든 락 획득이 요청 스레드(Tomcat worker) 위에서 일어나므로
  *   ThreadLocal 하나로 정확히 묶인다.
  *
- * [슬롯 구성] [0]=락 대기, [1]=락 보유, [2]=broadcast
+ * [슬롯 구성] [0]=락 대기, [1]=락 보유, [2]=broadcast, [3]=사전 거절
  *   - TimingBidLock 이 [0], [1] 을 채운다
  *   - SimpMessagingTemplate spy 가 [2] 를 채운다(락 보유 안에서 실행되므로 같은 스레드)
  *   - ServerTimingFilter 가 요청 종료 시 읽어 LoadSamples 에 기록하고 비운다
  */
 final class RequestTiming {
 
-    static final ThreadLocal<long[]> SLOT = ThreadLocal.withInitial(() -> new long[3]);
+    static final ThreadLocal<long[]> SLOT = ThreadLocal.withInitial(() -> new long[4]);
 
     static final int WAIT = 0;
     static final int HOLD = 1;
     static final int BROADCAST = 2;
+    static final int PRECHECK = 3; // 사전 거절(Redis 왕복 포함) — TimingBidPriceGuard가 채운다
 
     private RequestTiming() {
     }
@@ -35,5 +36,6 @@ final class RequestTiming {
         slot[WAIT] = 0;
         slot[HOLD] = 0;
         slot[BROADCAST] = 0;
+        slot[PRECHECK] = 0;
     }
 }
