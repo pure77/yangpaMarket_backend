@@ -12,7 +12,9 @@ import com.example.yanpaMarket_backend.auction.dto.AuctionSummaryResponse;
 import com.example.yanpaMarket_backend.auction.dto.AuctionUpdateRequest;
 import com.example.yanpaMarket_backend.auction.repository.AuctionImageRepository;
 import com.example.yanpaMarket_backend.auction.repository.AuctionRepository;
+import com.example.yanpaMarket_backend.auction.precheck.BidPriceGuard;
 import com.example.yanpaMarket_backend.common.time.AuctionClock;
+import com.example.yanpaMarket_backend.common.transaction.AfterCommit;
 import com.example.yanpaMarket_backend.common.util.PublicIdGenerator;
 import com.example.yanpaMarket_backend.global.error.ApiException;
 import com.example.yanpaMarket_backend.global.error.ErrorCode;
@@ -64,6 +66,8 @@ public class AuctionService {
     private final UserRepository userRepository;
     // [판정 시각] 경매 판정 시각은 AuctionClock 한 곳에서 받는다. 서버 증설 시 구현체만 바꾸기 위해서다.
     private final AuctionClock auctionClock;
+    // [Redis 현재가 사본 무효화] 경매 내용이 바뀌면 커밋 후 사본을 지운다(시작가가 내려가는 유일한 경로).
+    private final BidPriceGuard bidPriceGuard;
 
     // application.properties: app.auction.publish-delay-seconds=10 (기본값 10초, 테스트용)
     @Value("${app.auction.publish-delay-seconds:10}")
@@ -158,6 +162,12 @@ public class AuctionService {
                 request.title(), request.description(), request.category(),
                 request.condition(), request.startPrice(), request.buyNowPrice(), request.endTime());
 
+        // [커밋 후 evict] 시작가를 낮추면 Redis의 현재가가 실제보다 높게 남아 유효한 입찰을 거절할 수 있다.
+        //   커밋이 확정된 뒤에만 지운다(롤백되면 그대로 둔다). guard는 예외를 던지지 않으므로 커밋 후 500이 나지 않는다.
+        //   [지금은 방어용] 수정은 입찰 0건일 때만 가능하고 키는 입찰 커밋 후에만 생긴다. 마감 연장 같은 경로가 생길 때를 위한 것.
+        Long auctionId = auction.getId();
+        AfterCommit.run(() -> bidPriceGuard.evict(auctionId));
+
         // 아직 공개 전인 경매를 수정하면 공개 유예를 수정 시점 기준으로 다시 부여한다
         LocalDateTime now = auctionClock.now();
         if (auction.getStartAt().isAfter(now)) {
@@ -193,6 +203,9 @@ public class AuctionService {
             throw new ApiException(ErrorCode.CANNOT_MODIFY);
         }
         auction.cancel("판매자 취소");
+        // [커밋 후 evict] 취소된 경매의 사본을 남겨 둘 이유가 없다. 이유와 안전성은 update와 같다.
+        Long auctionId = auction.getId();
+        AfterCommit.run(() -> bidPriceGuard.evict(auctionId));
     }
 
     // =========================================================================
