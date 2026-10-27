@@ -36,6 +36,8 @@ dependencies {
 	// 입찰 경로의 락 밖 조회(경매 ID, 사용자 요약)를 캐시해 DB 커넥션 획득을 줄인다. 설정은 CacheConfig.
 	implementation 'org.springframework.boot:spring-boot-starter-cache'
 	implementation 'com.github.ben-manes.caffeine:caffeine'
+	// [Redis] 입찰 사전 거절용 현재가 사본. 클라이언트는 Lettuce(스타터 기본). 설정은 RedisConfig / application.properties.
+	implementation 'org.springframework.boot:spring-boot-starter-data-redis'
 	implementation 'org.flywaydb:flyway-core'
 	implementation 'com.github.f4b6a3:ulid-creator:5.2.3'
 	implementation 'io.jsonwebtoken:jjwt-api:0.12.6'
@@ -51,6 +53,8 @@ dependencies {
 	mockitoAgent('org.mockito:mockito-core') { transitive = false } // 버전은 Spring Boot BOM
 	testCompileOnly 'org.projectlombok:lombok'
 	testRuntimeOnly 'com.h2database:h2'
+	// [Testcontainers] Redis 테스트는 진짜 Redis 컨테이너에서 돈다(Lua 원자성·타임아웃 동작을 검증해야 해서). Docker 필요.
+	testImplementation 'org.testcontainers:testcontainers'
 	testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
 	testAnnotationProcessor 'org.projectlombok:lombok'
 
