@@ -10,6 +10,17 @@ import com.example.yanpaMarket_backend.auction.precheck.BidRedisKeys;
 import com.example.yanpaMarket_backend.auction.precheck.GuardStats;
 import com.example.yanpaMarket_backend.auction.precheck.RedisBidPriceGuard;
 import com.example.yanpaMarket_backend.auction.repository.AuctionRepository;
+import com.example.yanpaMarket_backend.auction.repository.BidRepository;
+import java.util.Map;
+import java.util.TreeMap;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+import org.springframework.data.domain.PageRequest;
 import com.example.yanpaMarket_backend.common.util.PublicIdGenerator;
 import com.example.yanpaMarket_backend.security.JwtProvider;
 import com.example.yanpaMarket_backend.support.RedisTestSupport;
@@ -211,6 +222,85 @@ class MultiServerBidTest extends RedisTestSupport {
                     HttpResponse.BodyHandlers.ofString());
             assertThat(res.statusCode()).as("서버 %s 공개 목록 응답", server.name()).isEqualTo(200);
         }
+    }
+
+    @Test
+    @Order(1)
+    void 상황1_같은_경매에_두_서버로_동시_입찰() throws Exception {
+        line("[상황 1] 동시 입찰 (모드: " + SCENARIO_1_GATE + ")");
+        int bidderCount = 40;
+        Fixture f = fixture("s1", 9101, bidderCount, LocalDateTime.now().plusMinutes(10));
+        String auctionId = f.auction().getPublicId();
+
+        // 서버:상태코드 → 건수 (예: "A:201", "B:409", "A:-1"=IO 오류)
+        Map<String, AtomicInteger> counts = new ConcurrentHashMap<>();
+        AtomicLong maxAccepted = new AtomicLong(0);
+        long deadline = System.nanoTime() + Duration.ofSeconds(10).toNanos();
+        CountDownLatch start = new CountDownLatch(1);
+        ExecutorService pool = Executors.newFixedThreadPool(bidderCount);
+        try {
+            for (int i = 0; i < bidderCount; i++) {
+                ServerHandle target = i % 2 == 0 ? serverA : serverB; // 절반은 A, 절반은 B
+                String token = f.tokens().get(i);
+                pool.submit(() -> {
+                    start.await();
+                    long amount = 20_000L;
+                    while (System.nanoTime() < deadline) {
+                        BidResult r = client.bid(target, auctionId, token, amount);
+                        counts.computeIfAbsent(target.name() + ":" + r.status(), k -> new AtomicInteger()).incrementAndGet();
+                        if (r.status() == 201) {
+                            maxAccepted.accumulateAndGet(amount, Math::max);
+                            amount += INCREMENT;
+                        } else if (r.status() == 400 && "BID_TOO_LOW".equals(r.code()) && r.minimumBid() != null) {
+                            amount = r.minimumBid(); // 거절 응답의 최소 입찰가로 재시도 — 실제 경합처럼 몰리게
+                        }
+                        // 409(충돌)·그 외는 같은 금액으로 재시도
+                        Thread.sleep(20);
+                    }
+                    return null;
+                });
+            }
+            start.countDown();
+            pool.shutdown();
+            assertThat(pool.awaitTermination(40, TimeUnit.SECONDS)).as("입찰 스레드 종료").isTrue();
+        } finally {
+            pool.shutdownNow();
+        }
+
+        int created = count(counts, "201");
+        int conflicts = count(counts, "409");
+        int unexpected = 0;
+        for (Map.Entry<String, AtomicInteger> e : counts.entrySet()) {
+            String status = e.getKey().substring(2);
+            if (!status.equals("201") && !status.equals("400") && !status.equals("409")) {
+                unexpected += e.getValue().get();
+            }
+        }
+        line("  응답 (서버:상태 → 건수) " + new TreeMap<>(counts));
+
+        Auction reloaded = reload(f);
+        long persisted = serverA.bean(BidRepository.class)
+                .findByAuctionIdOrderByCreatedAtDesc(reloaded.getId(), PageRequest.of(0, 1)).getTotalElements();
+
+        // ── 항상 엄격 ──
+        assertThat(unexpected).as("500·IO 등 예상 밖 응답 수 " + new TreeMap<>(counts)).isZero();
+        assertThat(reloaded.getBidCount()).as("DB 입찰 수 == 201 응답 수").isEqualTo(created);
+        assertThat(persisted).as("저장된 입찰 행 수 == 201 응답 수").isEqualTo(created);
+        assertThat(reloaded.getCurrentPrice()).as("DB 현재가 == 성공한 최고 금액").isEqualTo(maxAccepted.get());
+        assertThat(redisPrice(reloaded.getId())).as("Redis 사본 == DB 현재가")
+                .isEqualTo(String.valueOf(reloaded.getCurrentPrice()));
+        line("  정합성 OK — 입찰 수 " + reloaded.getBidCount() + " == 성공 " + created
+                + ", 현재가 " + reloaded.getCurrentPrice() + " == 최고 성공가, Redis == DB");
+
+        // ── 목표 ──
+        checkTarget(SCENARIO_1_GATE, conflicts == 0, "409(ALREADY_BIDDING) 0건 (현재 " + conflicts + "건)",
+                "2단계 분산 락");
+    }
+
+    /** 두 서버 합계: 상태코드별 건수. */
+    private static int count(Map<String, AtomicInteger> counts, String status) {
+        return counts.getOrDefault("A:" + status, new AtomicInteger()).get()
+                + counts.getOrDefault("B:" + status, new AtomicInteger()).get();
     }
 
     @Test
