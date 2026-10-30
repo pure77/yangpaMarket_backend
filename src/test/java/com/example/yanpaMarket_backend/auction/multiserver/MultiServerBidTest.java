@@ -18,7 +18,10 @@ import java.util.Map;
 import java.util.TreeMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Future;
+import java.util.function.BiPredicate;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -235,8 +238,11 @@ class MultiServerBidTest extends RedisTestSupport {
         Fixture f = fixture("s1", 9101, bidderCount, LocalDateTime.now().plusMinutes(10));
         String auctionId = f.auction().getPublicId();
 
-        // 서버:상태코드 → 건수 (예: "A:201", "B:409", "A:-1"=IO 오류)
+        // 서버:상태:에러코드 → 건수 (예: "A:201:-", "B:409:ALREADY_BIDDING", "A:-1:-"=IO 오류)
+        // [왜 코드까지] 상태만 세면 AUCTION_ENDED 같은 400(준비 잘못)도 "정상"으로 통과하고,
+        //   모든 409가 ALREADY_BIDDING(락 충돌)인 것처럼 보인다.
         Map<String, AtomicInteger> counts = new ConcurrentHashMap<>();
+        List<Future<?>> workers = new ArrayList<>();
         AtomicLong maxAccepted = new AtomicLong(0);
         long deadline = System.nanoTime() + Duration.ofSeconds(10).toNanos();
         CountDownLatch start = new CountDownLatch(1);
@@ -245,12 +251,14 @@ class MultiServerBidTest extends RedisTestSupport {
             for (int i = 0; i < bidderCount; i++) {
                 ServerHandle target = i % 2 == 0 ? serverA : serverB; // 절반은 A, 절반은 B
                 String token = f.tokens().get(i);
-                pool.submit(() -> {
+                workers.add(pool.submit(() -> {
                     start.await();
                     long amount = 20_000L;
                     while (System.nanoTime() < deadline) {
                         BidResult r = client.bid(target, auctionId, token, amount);
-                        counts.computeIfAbsent(target.name() + ":" + r.status(), k -> new AtomicInteger()).incrementAndGet();
+                        String code = r.code() == null ? "-" : r.code();
+                        counts.computeIfAbsent(target.name() + ":" + r.status() + ":" + code, k -> new AtomicInteger())
+                                .incrementAndGet();
                         if (r.status() == 201) {
                             maxAccepted.accumulateAndGet(amount, Math::max);
                             amount += INCREMENT;
@@ -261,25 +269,30 @@ class MultiServerBidTest extends RedisTestSupport {
                         Thread.sleep(20);
                     }
                     return null;
-                });
+                }));
             }
             start.countDown();
             pool.shutdown();
             assertThat(pool.awaitTermination(40, TimeUnit.SECONDS)).as("입찰 스레드 종료").isTrue();
+            // [왜 get()] 작업 스레드 안의 예외는 Future에만 담긴다. 확인하지 않으면 조용히 묻힌다.
+            for (Future<?> w : workers) {
+                try {
+                    w.get();
+                } catch (ExecutionException e) {
+                    fail("입찰 작업 스레드에서 예외 발생: " + e.getCause(), e.getCause());
+                }
+            }
         } finally {
             pool.shutdownNow();
         }
 
-        int created = count(counts, "201");
-        int conflicts = count(counts, "409");
-        int unexpected = 0;
-        for (Map.Entry<String, AtomicInteger> e : counts.entrySet()) {
-            String status = e.getKey().substring(2);
-            if (!status.equals("201") && !status.equals("400") && !status.equals("409")) {
-                unexpected += e.getValue().get();
-            }
-        }
-        line("  응답 (서버:상태 → 건수) " + new TreeMap<>(counts));
+        // 정상 응답 = 201, 400+BID_TOO_LOW(경합으로 가격이 올라 있음), 409+ALREADY_BIDDING(락 충돌). 나머지는 모두 예상 밖.
+        int created = sumCounts(counts, (status, code) -> status == 201);
+        int conflicts = sumCounts(counts, (status, code) -> status == 409 && "ALREADY_BIDDING".equals(code));
+        int unexpected = sumCounts(counts, (status, code) -> !(status == 201
+                || (status == 400 && "BID_TOO_LOW".equals(code))
+                || (status == 409 && "ALREADY_BIDDING".equals(code))));
+        line("  응답 (서버:상태:코드 → 건수) " + new TreeMap<>(counts));
 
         Auction reloaded = reload(f);
         long persisted = serverA.bean(BidRepository.class)
@@ -368,15 +381,19 @@ class MultiServerBidTest extends RedisTestSupport {
         Fixture f = fixture("s3", 9103, 1, LocalDateTime.now().plusSeconds(5));
         String auctionId = f.auction().getPublicId();
 
-        BidResult bid = client.bid(serverA, auctionId, f.tokens().get(0), 20_000L);
-        assertThat(bid.status()).as("마감 전 입찰").isEqualTo(201);
-
+        // [왜 구독이 먼저] 종료는 endAt 이후에만 일어난다. 구독을 먼저 끝내 두면 어떤 종료 메시지보다
+        //   구독자가 확실히 살아 있다. 구독·입찰이 마감 전에 끝났는지는 아래에서 검증한다.
         List<Subscriber> subscribers = new ArrayList<>();
         for (int i = 0; i < 3; i++) {
             subscribers.add(client.subscribe(serverA, auctionId));
             subscribers.add(client.subscribe(serverB, auctionId));
         }
         Thread.sleep(1000); // 구독 등록 반영
+
+        BidResult bid = client.bid(serverA, auctionId, f.tokens().get(0), 20_000L);
+        assertThat(bid.status()).as("마감 전 입찰").isEqualTo(201);
+        assertThat(LocalDateTime.now().isBefore(f.auction().getEndAt()))
+                .as("준비 지연(테스트 구성 문제): 구독·입찰이 마감 전에 끝나지 않았다").isTrue();
 
         // 두 서버의 스케줄러(10초 주기)가 마감된 경매를 종료할 때까지 기다린다
         boolean closed = waitUntil(Duration.ofSeconds(30), () -> reload(f).getStatus() != AuctionStatus.ACTIVE);
@@ -396,25 +413,32 @@ class MultiServerBidTest extends RedisTestSupport {
 
         // ── 목표 ──
         StringBuilder perServer = new StringBuilder();
-        int sendingServers = 0;
+        // 3단계(서버 간 전파) 후에는 한 서버만 닫아도 양쪽 구독자가 받으므로 이 값은 2가 된다.
+        int receivingServers = 0;
         for (String server : List.of("A", "B")) {
             List<Integer> endedCounts = subscribers.stream().filter(s -> s.server().equals(server))
                     .map(Subscriber::auctionEndedCount).toList();
             if (endedCounts.stream().anyMatch(c -> c > 0)) {
-                sendingServers++;
+                receivingServers++;
             }
             perServer.append(server).append(" 구독자 종료 메시지 ").append(endedCounts).append("회   ");
         }
-        line("  " + perServer.toString().trim() + "  (종료 메시지를 보낸 서버 " + sendingServers + "대)");
+        line("  " + perServer.toString().trim() + "  (종료 메시지를 받은 구독자가 있는 서버 " + receivingServers + "대)");
         boolean exactlyOnce = subscribers.stream().allMatch(s -> s.auctionEndedCount() == 1);
         checkTarget(SCENARIO_3_GATE, exactlyOnce, "모든 구독자가 종료 메시지를 정확히 1번 수신",
                 "3단계 서버 간 전파·스케줄러 중복 방지");
     }
 
-    /** 두 서버 합계: 상태코드별 건수. */
-    private static int count(Map<String, AtomicInteger> counts, String status) {
-        return counts.getOrDefault("A:" + status, new AtomicInteger()).get()
-                + counts.getOrDefault("B:" + status, new AtomicInteger()).get();
+    /** "서버:상태:코드" 키 중 조건에 맞는 것의 건수 합계. 코드가 없으면 "-". */
+    private static int sumCounts(Map<String, AtomicInteger> counts, BiPredicate<Integer, String> match) {
+        int sum = 0;
+        for (Map.Entry<String, AtomicInteger> e : counts.entrySet()) {
+            String[] parts = e.getKey().split(":", 3);
+            if (match.test(Integer.parseInt(parts[1]), parts[2])) {
+                sum += e.getValue().get();
+            }
+        }
+        return sum;
     }
 
     @Test
