@@ -11,6 +11,8 @@ import com.example.yanpaMarket_backend.auction.precheck.GuardStats;
 import com.example.yanpaMarket_backend.auction.precheck.RedisBidPriceGuard;
 import com.example.yanpaMarket_backend.auction.repository.AuctionRepository;
 import com.example.yanpaMarket_backend.auction.repository.BidRepository;
+import com.example.yanpaMarket_backend.support.multiserver.MultiServerClient.Subscriber;
+import java.util.HashSet;
 import java.util.Map;
 import java.util.TreeMap;
 import java.util.concurrent.ConcurrentHashMap;
@@ -295,6 +297,61 @@ class MultiServerBidTest extends RedisTestSupport {
         // ── 목표 ──
         checkTarget(SCENARIO_1_GATE, conflicts == 0, "409(ALREADY_BIDDING) 0건 (현재 " + conflicts + "건)",
                 "2단계 분산 락");
+    }
+
+    /**
+     * [왜 이 테스트] 입찰 갱신 메시지는 처리한 서버의 인메모리 브로커로만 나간다.
+     * 서버 A·B 각각에 구독자를 두고 A/B 번갈아 입찰해, 메시지가 서버를 넘어 전달되는지 관찰한다.
+     * 엄격: 자기 서버 메시지 수신·중복/초과 없음·STOMP 오류 없음. 목표: 전원이 전부 수신(현재 미해결 예상).
+     */
+    @Test
+    @Order(2)
+    void 상황2_실시간_메시지가_서버를_넘어가는지() throws Exception {
+        line("[상황 2] 서버 간 메시지 전파 (모드: " + SCENARIO_2_GATE + ")");
+        int bids = 10;
+        Fixture f = fixture("s2", 9102, bids, LocalDateTime.now().plusMinutes(10));
+        String auctionId = f.auction().getPublicId();
+
+        List<Subscriber> subscribers = new ArrayList<>();
+        for (int i = 0; i < 5; i++) {
+            subscribers.add(client.subscribe(serverA, auctionId));
+            subscribers.add(client.subscribe(serverB, auctionId));
+        }
+        Thread.sleep(1000); // 구독 등록이 각 서버 브로커에 반영될 시간
+
+        List<Long> pricesViaA = new ArrayList<>();
+        List<Long> pricesViaB = new ArrayList<>();
+        for (int i = 0; i < bids; i++) {
+            ServerHandle target = i % 2 == 0 ? serverA : serverB; // A, B, A, B …
+            long amount = 20_000L + i * INCREMENT;
+            BidResult r = client.bid(target, auctionId, f.tokens().get(i), amount);
+            assertThat(r.status()).as("준비 입찰 %d (%s, %d원)", i, target.name(), amount).isEqualTo(201);
+            (target == serverA ? pricesViaA : pricesViaB).add(amount);
+        }
+        waitUntil(Duration.ofSeconds(2),
+                () -> subscribers.stream().allMatch(s -> s.bidUpdatePrices().size() >= bids));
+
+        // ── 항상 엄격 ──
+        for (Subscriber s : subscribers) {
+            assertThat(s.errorCount()).as("%s 구독자 STOMP 오류 없음", s.server()).isZero();
+            List<Long> received = s.bidUpdatePrices();
+            List<Long> ownServerPrices = s.server().equals("A") ? pricesViaA : pricesViaB;
+            assertThat(received).as("%s 구독자는 자기 서버에서 처리된 입찰 갱신을 모두 받아야 한다", s.server())
+                    .containsAll(ownServerPrices);
+            assertThat(new HashSet<>(received)).as("%s 구독자 중복 수신 없음", s.server()).hasSameSizeAs(received);
+            assertThat(received.size()).as("%s 구독자 최대 %d건", s.server(), bids).isLessThanOrEqualTo(bids);
+        }
+
+        // ── 목표 ──
+        StringBuilder perServer = new StringBuilder();
+        for (String server : List.of("A", "B")) {
+            List<Integer> sizes = subscribers.stream().filter(s -> s.server().equals(server))
+                    .map(s -> s.bidUpdatePrices().size()).toList();
+            perServer.append(server).append(" 구독자 수신 ").append(sizes).append("/").append(bids).append("   ");
+        }
+        line("  " + perServer.toString().trim());
+        boolean allReceived = subscribers.stream().allMatch(s -> s.bidUpdatePrices().size() == bids);
+        checkTarget(SCENARIO_2_GATE, allReceived, "모든 구독자가 " + bids + "건 전부 수신", "3단계 서버 간 전파");
     }
 
     /** 두 서버 합계: 상태코드별 건수. */
