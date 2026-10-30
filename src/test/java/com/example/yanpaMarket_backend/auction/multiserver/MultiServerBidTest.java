@@ -5,6 +5,7 @@ import static org.assertj.core.api.Assertions.fail;
 
 import com.example.yanpaMarket_backend.auction.domain.Auction;
 import com.example.yanpaMarket_backend.auction.domain.AuctionCategory;
+import com.example.yanpaMarket_backend.auction.domain.AuctionStatus;
 import com.example.yanpaMarket_backend.auction.domain.AuctionItemCondition;
 import com.example.yanpaMarket_backend.auction.precheck.BidRedisKeys;
 import com.example.yanpaMarket_backend.auction.precheck.GuardStats;
@@ -352,6 +353,62 @@ class MultiServerBidTest extends RedisTestSupport {
         line("  " + perServer.toString().trim());
         boolean allReceived = subscribers.stream().allMatch(s -> s.bidUpdatePrices().size() == bids);
         checkTarget(SCENARIO_2_GATE, allReceived, "모든 구독자가 " + bids + "건 전부 수신", "3단계 서버 간 전파");
+    }
+
+    /**
+     * [왜 이 테스트] 종료 스케줄러(10초 주기)는 두 서버 모두에서 돈다. 같은 경매를 두 서버가 각자 닫으려 할 때
+     * DB 최종 상태가 한 번만 정상 반영되는지, 종료 메시지가 구독자에게 몇 번 가는지 관찰한다.
+     * 엄격: 최종 상태·낙찰자·종료 시각·STOMP 오류 없음. 목표: 모든 구독자가 종료 메시지를 정확히 1번 수신.
+     */
+    @Test
+    @Order(3)
+    void 상황3_경매_종료_스케줄러() throws Exception {
+        line("[상황 3] 종료 스케줄러 (모드: " + SCENARIO_3_GATE + ")");
+        // [5초 뒤 마감] 생성 직후 입찰 1건이 마감 전에 성공해야 한다. 느린 PC를 고려해 spec의 3초보다 여유를 둔다.
+        Fixture f = fixture("s3", 9103, 1, LocalDateTime.now().plusSeconds(5));
+        String auctionId = f.auction().getPublicId();
+
+        BidResult bid = client.bid(serverA, auctionId, f.tokens().get(0), 20_000L);
+        assertThat(bid.status()).as("마감 전 입찰").isEqualTo(201);
+
+        List<Subscriber> subscribers = new ArrayList<>();
+        for (int i = 0; i < 3; i++) {
+            subscribers.add(client.subscribe(serverA, auctionId));
+            subscribers.add(client.subscribe(serverB, auctionId));
+        }
+        Thread.sleep(1000); // 구독 등록 반영
+
+        // 두 서버의 스케줄러(10초 주기)가 마감된 경매를 종료할 때까지 기다린다
+        boolean closed = waitUntil(Duration.ofSeconds(30), () -> reload(f).getStatus() != AuctionStatus.ACTIVE);
+        assertThat(closed).as("30초 안에 경매 종료").isTrue();
+        // 다른 서버가 다음 주기에 한 번 더 종료(·메시지 전송)하는지 보려고 한 주기를 더 기다린다
+        Thread.sleep(11_000);
+
+        // ── 항상 엄격 ──
+        Auction reloaded = reload(f);
+        assertThat(reloaded.getStatus()).as("최종 상태").isEqualTo(AuctionStatus.PAYMENT_PENDING);
+        assertThat(reloaded.getWinnerUserId()).as("낙찰자").isEqualTo(f.bidders().get(0).getId());
+        assertThat(reloaded.getEndedAt()).as("종료 시각 기록").isNotNull();
+        for (Subscriber s : subscribers) {
+            assertThat(s.errorCount()).as("%s 구독자 STOMP 오류 없음", s.server()).isZero();
+        }
+        line("  DB 최종 상태 OK — PAYMENT_PENDING, 낙찰자 일치, 종료 시각 기록");
+
+        // ── 목표 ──
+        StringBuilder perServer = new StringBuilder();
+        int sendingServers = 0;
+        for (String server : List.of("A", "B")) {
+            List<Integer> endedCounts = subscribers.stream().filter(s -> s.server().equals(server))
+                    .map(Subscriber::auctionEndedCount).toList();
+            if (endedCounts.stream().anyMatch(c -> c > 0)) {
+                sendingServers++;
+            }
+            perServer.append(server).append(" 구독자 종료 메시지 ").append(endedCounts).append("회   ");
+        }
+        line("  " + perServer.toString().trim() + "  (종료 메시지를 보낸 서버 " + sendingServers + "대)");
+        boolean exactlyOnce = subscribers.stream().allMatch(s -> s.auctionEndedCount() == 1);
+        checkTarget(SCENARIO_3_GATE, exactlyOnce, "모든 구독자가 종료 메시지를 정확히 1번 수신",
+                "3단계 서버 간 전파·스케줄러 중복 방지");
     }
 
     /** 두 서버 합계: 상태코드별 건수. */
