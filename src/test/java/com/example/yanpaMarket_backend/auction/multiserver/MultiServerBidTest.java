@@ -89,16 +89,20 @@ class MultiServerBidTest extends RedisTestSupport {
 
     @AfterAll
     static void stopServers() throws IOException {
-        if (client != null) {
-            client.close();
+        // [왜 finally] 종료 중 예외가 나도 지금까지 쌓은 리포트는 반드시 남긴다.
+        try {
+            if (client != null) {
+                client.close();
+            }
+            if (serverB != null) {
+                serverB.close();
+            }
+            if (serverA != null) {
+                serverA.close();
+            }
+        } finally {
+            writeReport();
         }
-        if (serverB != null) {
-            serverB.close();
-        }
-        if (serverA != null) {
-            serverA.close();
-        }
-        writeReport();
     }
 
     // ── 도우미 ─────────────────────────────────────────────────────────────

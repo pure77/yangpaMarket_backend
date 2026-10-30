@@ -12,6 +12,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.springframework.lang.NonNull;
+import org.springframework.messaging.simp.stomp.StompCommand;
 import org.springframework.messaging.simp.stomp.StompFrameHandler;
 import org.springframework.messaging.simp.stomp.StompHeaders;
 import org.springframework.messaging.simp.stomp.StompSession;
@@ -21,6 +22,7 @@ import org.springframework.web.socket.messaging.WebSocketStompClient;
 import org.springframework.web.socket.sockjs.client.SockJsClient;
 import org.springframework.web.socket.sockjs.client.Transport;
 import org.springframework.web.socket.sockjs.client.WebSocketTransport;
+import tools.jackson.core.JacksonException;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.ObjectMapper;
 
@@ -39,6 +41,8 @@ public final class MultiServerClient implements AutoCloseable {
         private final String server;
         private final List<Long> bidUpdatePrices = new CopyOnWriteArrayList<>();
         private final AtomicInteger auctionEnded = new AtomicInteger();
+        // [왜 오류를 센다] 메시지 누락 수를 셀 때 파싱 실패·연결 끊김이 "못 받음"으로 묻히면 안 된다. 오류는 따로 센다.
+        private final AtomicInteger errors = new AtomicInteger();
 
         Subscriber(String server) {
             this.server = server;
@@ -54,6 +58,15 @@ public final class MultiServerClient implements AutoCloseable {
 
         public int auctionEndedCount() {
             return auctionEnded.get();
+        }
+
+        public int errorCount() {
+            return errors.get();
+        }
+
+        void recordError(Throwable error) {
+            errors.incrementAndGet();
+            System.err.println("[STOMP 오류] 서버 " + server + ": " + error.getMessage());
         }
     }
 
@@ -71,8 +84,10 @@ public final class MultiServerClient implements AutoCloseable {
                 .timeout(Duration.ofSeconds(10))
                 .POST(HttpRequest.BodyPublishers.ofString("{\"amount\":" + amount + "}"))
                 .build();
+        int status = -1;
         try {
             HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString());
+            status = response.statusCode();
             String body = response.body();
             if (body == null || body.isBlank()) {
                 return new BidResult(response.statusCode(), null, null, null);
@@ -85,6 +100,9 @@ public final class MultiServerClient implements AutoCloseable {
                     code.isMissingNode() || code.isNull() ? null : code.asText(),
                     longOrNull(data.path("currentPrice")),
                     longOrNull(data.path("minimumBid")));
+        } catch (JacksonException e) {
+            // [왜] 비JSON·잘린 응답(HTML 오류 페이지 등)도 예외로 던지지 않고 결과로 돌려줘 동시 입찰 워커가 죽지 않게 한다.
+            return new BidResult(status, "NON_JSON", null, null);
         } catch (IOException e) {
             return new BidResult(-1, e.getClass().getSimpleName(), null, null);
         } catch (InterruptedException e) {
@@ -99,11 +117,24 @@ public final class MultiServerClient implements AutoCloseable {
 
     /** server의 /ws에 접속해 경매 토픽을 구독한다. 메시지는 type 필드로 구분해 기록한다. */
     public Subscriber subscribe(ServerHandle server, String auctionPublicId) throws Exception {
+        Subscriber subscriber = new Subscriber(server.name());
+        // [왜 오류 핸들러] 프레임 처리 예외·연결 끊김을 삼키면 "메시지 못 받음"처럼 보인다. 구독자별로 오류를 센다.
+        StompSessionHandlerAdapter sessionHandler = new StompSessionHandlerAdapter() {
+            @Override
+            public void handleException(@NonNull StompSession session, StompCommand command,
+                    @NonNull StompHeaders headers, @NonNull byte[] payload, @NonNull Throwable exception) {
+                subscriber.recordError(exception);
+            }
+
+            @Override
+            public void handleTransportError(@NonNull StompSession session, @NonNull Throwable exception) {
+                subscriber.recordError(exception);
+            }
+        };
         StompSession session = stomp
-                .connectAsync(server.baseUrl() + "/ws", new StompSessionHandlerAdapter() {})
+                .connectAsync(server.baseUrl() + "/ws", sessionHandler)
                 .get(10, TimeUnit.SECONDS);
         sessions.add(session);
-        Subscriber subscriber = new Subscriber(server.name());
         session.subscribe("/topic/auction/" + auctionPublicId, new StompFrameHandler() {
             @Override
             @NonNull
@@ -113,12 +144,16 @@ public final class MultiServerClient implements AutoCloseable {
 
             @Override
             public void handleFrame(@NonNull StompHeaders headers, Object payload) {
-                JsonNode node = json.readTree((byte[]) payload);
-                String type = node.path("type").asText();
-                if ("BID_UPDATE".equals(type)) {
-                    subscriber.bidUpdatePrices.add(node.path("currentPrice").asLong());
-                } else if ("AUCTION_ENDED".equals(type)) {
-                    subscriber.auctionEnded.incrementAndGet();
+                try {
+                    JsonNode node = json.readTree((byte[]) payload);
+                    String type = node.path("type").asText();
+                    if ("BID_UPDATE".equals(type)) {
+                        subscriber.bidUpdatePrices.add(node.path("currentPrice").asLong());
+                    } else if ("AUCTION_ENDED".equals(type)) {
+                        subscriber.auctionEnded.incrementAndGet();
+                    }
+                } catch (RuntimeException e) {
+                    subscriber.recordError(e); // 깨진 프레임은 버리지 않고 오류로 센다
                 }
             }
         });
