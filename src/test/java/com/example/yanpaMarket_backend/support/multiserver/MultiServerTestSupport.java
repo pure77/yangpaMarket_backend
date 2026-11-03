@@ -59,6 +59,15 @@ public final class MultiServerTestSupport {
      * @param ddlAuto  첫 서버 "create", 그 뒤 서버 "validate"
      */
     public static ServerHandle startServer(String name, String ddlAuto, String redisHost, int redisPort) {
+        return startServer(name, ddlAuto, redisHost, redisPort, true);
+    }
+
+    /**
+     * @param precheckEnabled Redis 사전 거절 켬/끔. 서버 2대 부하 측정(MultiServerLoadTest)이 켬/끔을 비교할 때 쓴다.
+     *                        끄면 NoOpBidPriceGuard — 입찰 경로가 Redis 도입 전과 같다(Redis를 전혀 쓰지 않음).
+     */
+    public static ServerHandle startServer(String name, String ddlAuto, String redisHost, int redisPort,
+                                           boolean precheckEnabled) {
         MySQLContainer db = mysql();
         String jdbcUrl = db.getJdbcUrl()
                 + (db.getJdbcUrl().contains("?") ? "&" : "?")
@@ -75,7 +84,7 @@ public final class MultiServerTestSupport {
                 "--spring.data.redis.host=" + redisHost,
                 "--spring.data.redis.port=" + redisPort,
                 "--spring.data.redis.timeout=500ms",
-                "--app.bid.precheck.enabled=true",
+                "--app.bid.precheck.enabled=" + precheckEnabled,
                 "--spring.application.name=multiserver-" + name,
                 "--app.upload.dir=build/test-uploads/multiserver-" + name,
         };
