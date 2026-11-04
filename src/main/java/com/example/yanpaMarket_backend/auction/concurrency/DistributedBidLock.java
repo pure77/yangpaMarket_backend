@@ -27,6 +27,13 @@ import org.redisson.client.RedisException;
  * [fail-open] Redis가 죽거나 끊기거나 느리면(RedisException) 2단을 건너뛰고 1단만으로 처리한다.
  *   = 분산 락 도입 전 서버 2대 상태. 데이터는 @Version이 지키고 409만 다시 생긴다. 사전 거절과 같은 원칙
  *   ("Redis가 없으면 느려지거나 409가 늘 뿐, 틀리지 않는다"). 로그는 GuardFailureLog로 10초에 한 줄.
+ *
+ * [알려진 한계 — 정직하게]
+ *   1) 메모리 스트라이프(1단)는 Redis 락을 기다리는 동안(최대 wait) 계속 잡고 있다. 그래서 같은 서버에서
+ *      같은 스트라이프를 공유하는 다른 경매의 입찰도 그만큼 더 기다릴 수 있다.
+ *   2) 느린 Redis 때문에 tryLock이 시간 초과로 끝났는데 Redis에는 이미 락이 걸려 있었다면, fail-open으로
+ *      작업은 실행되지만 그 키는 lease가 끝날 때까지 남는다. 그 경매는 최대 lease(3초) 동안 409가 날 수 있다.
+ *      데이터는 @Version이 지키므로 정합성은 안전하다.
  */
 public class DistributedBidLock implements BidLock {
 

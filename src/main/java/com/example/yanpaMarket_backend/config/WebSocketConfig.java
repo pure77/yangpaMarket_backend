@@ -109,9 +109,10 @@ public class WebSocketConfig implements WebSocketMessageBrokerConfigurer {
         //        - 서버를 재시작하면 구독 정보가 전부 날아간다.
         //        - 서버를 2대로 늘리면 1번 서버의 구독자는 2번 서버가 보낸 메시지를 못 받는다.
         //          구독자 Map이 각 JVM 안에만 있기 때문. (메시지 영속성·재전송·ack도 없다)
-        //        → InMemoryBidLock의 한계와 정확히 같은 지점이다. 스케일아웃하는 순간 둘 다 깨진다.
-        //          그때가 브로커는 enableStompBrokerRelay(RabbitMQ/ActiveMQ), 락은 Redis 분산락으로
-        //          함께 교체할 시점이다. MVP 단계에서는 외부 인프라 없이 바로 도는 쪽을 택했다.
+        //        → 스케일아웃의 같은 계열 한계다. 락은 2단계(DistributedBidLock, Redisson)에서 해결됐고,
+        //          이 항목(서버 간 메시지 전파)은 3단계 몫이다. 브로커는 enableStompBrokerRelay
+        //          (RabbitMQ/ActiveMQ)나 Redis Pub/Sub 등으로 교체한다. MVP 단계에서는 외부 인프라 없이
+        //          바로 도는 쪽을 택했다.
         registry.enableSimpleBroker("/topic");
 
         // [무엇] 클라이언트가 SEND한 메시지 중 /app 으로 시작하는 것은 브로커로 직행시키지 않고

@@ -7,7 +7,8 @@ import org.springframework.stereotype.Component;
 /**
  * 고정 개수(256) ReentrantLock 스트라이프 기반 인메모리 락.
  * auctionId 해시로 스트라이프를 선택하므로 락 객체 수가 무한 증가하지 않는다.
- * 단일 인스턴스 한정 — 서버 2대 이상에서는 무력화되며, 그 시점이 Redis 분산 락 도입 트리거다.
+ * 이 락 자체는 같은 JVM 안에서만 유효하다. 분산 락을 켜면(app.bid.lock.distributed.enabled=true)
+ * DistributedBidLock의 1단(서버 안 줄서기)으로 쓰이고, 서버 간 직렬화는 2단 Redisson 락이 맡는다.
  *
  * [왜 synchronized가 아닌가]
  *   메서드에 synchronized를 걸면 모든 경매가 자물쇠 하나를 공유한다.

@@ -150,8 +150,9 @@ public class BidService {
                 return p;
             });
         } catch (OptimisticLockingFailureException e) {
-            // [이중 안전망] 1차 방어는 BidLock(같은 JVM 내 직렬화), 2차 방어는 Auction의 @Version(DB 레벨).
-            //   서버 2대 이상이면 인메모리 락은 무력화되지만 @Version은 살아 있어 정합성이 깨지지 않는다.
+            // [이중 안전망] 1차 방어는 BidLock(분산 락이면 서버 간, 아니면 같은 JVM 내 직렬화),
+            //   2차 방어는 Auction의 @Version(DB 레벨). Redis 장애로 분산 락이 빠지거나(fail-open) 락이
+            //   lease보다 먼저 풀려도 @Version은 살아 있어 정합성이 깨지지 않는다.
             // [예외 번역] 안 잡으면 GlobalExceptionHandler의 Exception 최종 방어선에 걸려 500이 나간다.
             //   서버 오류가 아니라 "재시도하면 되는" 상황이므로 409로 번역해 프론트가 안내할 수 있게 한다.
             throw new ApiException(ErrorCode.ALREADY_BIDDING);
