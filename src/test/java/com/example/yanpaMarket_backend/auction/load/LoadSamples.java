@@ -50,6 +50,15 @@ final class LoadSamples {
         return sorted[index] / 1_000_000.0;
     }
 
+    /** 최댓값(ms). 꼬리(p99 너머)가 대기 상한에 닿았는지 볼 때 쓴다. 샘플이 없으면 0. */
+    double maxMillis() {
+        long max = 0;
+        for (long v : nanos) {
+            max = Math.max(max, v);
+        }
+        return max / 1_000_000.0;
+    }
+
     double meanMillis() {
         long[] sorted = sortedNanos();
         if (sorted.length == 0) {

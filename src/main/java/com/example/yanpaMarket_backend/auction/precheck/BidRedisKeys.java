@@ -18,4 +18,9 @@ public final class BidRedisKeys {
     public static String bid(Long auctionId) {
         return "auction:{" + auctionId + "}:bid";
     }
+
+    /** 2단계 분산 락 키. bid(...)와 같은 {id} 해시 태그라 Cluster에서도 같은 슬롯이다. */
+    public static String lock(Long auctionId) {
+        return "auction:{" + auctionId + "}:lock";
+    }
 }

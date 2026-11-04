@@ -2,7 +2,7 @@
 
 ## Overview
 Spring Boot 기반 경매 백엔드 API 서버입니다.
-카카오 OAuth 인증, 경매 CRUD + 이미지 업로드, 실시간 입찰(락 + STOMP 브로드캐스트), 경매 자동 종료,
+카카오 OAuth 인증, 경매 CRUD + 이미지 업로드, 실시간 입찰(락 + STOMP 브로드캐스트), 서버 간 분산 락(Redisson, 2단 락), 경매 자동 종료,
 입찰 경로 조회 캐시까지 구현되어 있습니다. 결제(토스페이먼츠)는 아직 미구현입니다.
 API 명세는 `../docs/auction-project-spec.md`, 기능별 설계/계획은 `../docs/superpowers/`에 있습니다.
 
@@ -14,6 +14,7 @@ API 명세는 `../docs/auction-project-spec.md`, 기능별 설계/계획은 `../
 - Auth: JWT (jjwt 0.12.6) + 카카오 OAuth
 - Realtime: Spring WebSocket + STOMP (SockJS, 엔드포인트 `/ws`, 브로커 `/topic`)
 - Cache: Spring Cache + Caffeine (`config/CacheConfig`)
+- Lock: InMemoryBidLock + Redisson 분산 락(DistributedBidLock, app.bid.lock.distributed.enabled)
 - Storage: 로컬 디스크(`!prod`) / AWS S3(`prod`) — `image/storage/ImageStorage` 구현체로 분기
 - ID: ULID 기반 publicId (`ulid-creator`)
 - Boilerplate: Lombok
@@ -81,7 +82,7 @@ API 명세는 `../docs/auction-project-spec.md`, 기능별 설계/계획은 `../
 - `./gradlew clean` (Windows: `./gradlew.bat clean`) - 빌드 산출물 정리
 - 테스트 로그인 포함 실행: `./gradlew.bat bootRun --args='--spring.profiles.active=secret,dev'` (`POST /api/v1/auth/dev/login` 활성화)
 - 부하 테스트: `./gradlew.bat test --tests '*HotAuctionLoadTest*' -Dloadtest=true` (파라미터는 `build.gradle`의 `load.*` 참고, `_loadtest` 접미사 DB에서만 실행)
-- 서버 2대 재현 테스트: `./gradlew.bat test --tests '*MultiServerBidTest*' -Dmultiserver=true` (Docker 필요. 결과는 `build/reports/multiserver/`. 2·3단계 완료 시 테스트의 상황별 Gate를 STRICT로)
+- 서버 2대 재현 테스트: `./gradlew.bat test --tests '*MultiServerBidTest*' -Dmultiserver=true` (Docker 필요. 결과는 `build/reports/multiserver/`. 2단계 완료(상황 1 STRICT). 3단계 완료 시 상황 2·3 STRICT로)
 
 ## Important Notes
 - 민감 정보(DB 계정, 토큰 시크릿 등)는 Git에 커밋 금지
@@ -114,3 +115,4 @@ API 명세는 `../docs/auction-project-spec.md`, 기능별 설계/계획은 `../
 | 2026-09-29 | dev 프로필 테스트 로그인, 토큰 동시 갱신 500 수정, Flyway V1~V3 추가 | auth/db | 다중 사용자 테스트 |
 | 2026-10-12 | Caffeine 조회 캐시(경매 ID, 사용자 요약), 다중 경매 부하 테스트 | common/user/auction | 입찰 경로 DB 커넥션 감소 |
 | 2026-10-14 | CLAUDE.md/AGENTS.md를 현재 코드 상태에 맞게 갱신 | 문서 | 문서-코드 불일치 해소 |
+| 2026-11-04 | Redisson 2단 분산 락(DistributedBidLock), 서버 2대 409 0건 | auction/config | 스케일아웃 2단계 |

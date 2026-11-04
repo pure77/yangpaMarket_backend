@@ -11,6 +11,7 @@ import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.LongConsumer;
 import org.springframework.lang.NonNull;
 import org.springframework.messaging.simp.stomp.StompCommand;
 import org.springframework.messaging.simp.stomp.StompFrameHandler;
@@ -117,6 +118,14 @@ public final class MultiServerClient implements AutoCloseable {
 
     /** server의 /ws에 접속해 경매 토픽을 구독한다. 메시지는 type 필드로 구분해 기록한다. */
     public Subscriber subscribe(ServerHandle server, String auctionPublicId) throws Exception {
+        return subscribe(server, auctionPublicId, price -> { });
+    }
+
+    /**
+     * 위와 같고, 입찰 갱신(BID_UPDATE)을 받을 때마다 onBidUpdate에 현재가를 넘긴다.
+     * [왜] 부하 측정에서 입찰자들이 "화면에 보이는 현재가"를 공유하려면 메시지가 오는 즉시 반영해야 한다(목록을 나중에 읽으면 늦다).
+     */
+    public Subscriber subscribe(ServerHandle server, String auctionPublicId, LongConsumer onBidUpdate) throws Exception {
         Subscriber subscriber = new Subscriber(server.name());
         // [왜 오류 핸들러] 프레임 처리 예외·연결 끊김을 삼키면 "메시지 못 받음"처럼 보인다. 구독자별로 오류를 센다.
         StompSessionHandlerAdapter sessionHandler = new StompSessionHandlerAdapter() {
@@ -148,7 +157,9 @@ public final class MultiServerClient implements AutoCloseable {
                     JsonNode node = json.readTree((byte[]) payload);
                     String type = node.path("type").asText();
                     if ("BID_UPDATE".equals(type)) {
-                        subscriber.bidUpdatePrices.add(node.path("currentPrice").asLong());
+                        long price = node.path("currentPrice").asLong();
+                        subscriber.bidUpdatePrices.add(price);
+                        onBidUpdate.accept(price);
                     } else if ("AUCTION_ENDED".equals(type)) {
                         subscriber.auctionEnded.incrementAndGet();
                     }

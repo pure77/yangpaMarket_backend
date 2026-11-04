@@ -25,6 +25,8 @@ import org.testcontainers.utility.DockerImageName;
  *
  * [Redis 타임아웃 500ms] 이 PC는 부하 시 Docker 경유 Redis 왕복이 50ms를 넘을 수 있다(진단 결과).
  *   운영 기본값(50ms)이면 사전 거절이 타임아웃으로 건너뛰어져 엄격 검사가 이유 없이 실패할 수 있어서, 이 테스트에서만 늘린다.
+ *
+ * [분산 락] 두 서버는 같은 Redis의 auction:{id}:lock을 다툰다. Redisson 타임아웃은 spring.data.redis.timeout(500ms)을 따른다.
  */
 public final class MultiServerTestSupport {
 
@@ -59,6 +61,16 @@ public final class MultiServerTestSupport {
      * @param ddlAuto  첫 서버 "create", 그 뒤 서버 "validate"
      */
     public static ServerHandle startServer(String name, String ddlAuto, String redisHost, int redisPort) {
+        return startServer(name, ddlAuto, redisHost, redisPort, true);
+    }
+
+    /**
+     * @param precheckEnabled Redis 사전 거절 켬/끔. 서버 2대 부하 측정(MultiServerLoadTest)이 켬/끔을 비교할 때 쓴다.
+     *                        끄면 NoOpBidPriceGuard — 사전 거절에는 Redis를 쓰지 않는다.
+     *                        분산 락은 별도 스위치(-Dmultiserver.distributedLock)라, 켜져 있으면 사전 거절이 꺼져도 락에는 Redis를 쓴다.
+     */
+    public static ServerHandle startServer(String name, String ddlAuto, String redisHost, int redisPort,
+                                           boolean precheckEnabled) {
         MySQLContainer db = mysql();
         String jdbcUrl = db.getJdbcUrl()
                 + (db.getJdbcUrl().contains("?") ? "&" : "?")
@@ -75,7 +87,11 @@ public final class MultiServerTestSupport {
                 "--spring.data.redis.host=" + redisHost,
                 "--spring.data.redis.port=" + redisPort,
                 "--spring.data.redis.timeout=500ms",
-                "--app.bid.precheck.enabled=true",
+                "--app.bid.precheck.enabled=" + precheckEnabled,
+                // [분산 락] 기본 켬(2단계). -Dmultiserver.distributedLock=false면 도입 전 상태(서버마다 따로 락)를 재현한다.
+                "--app.bid.lock.distributed.enabled=" + System.getProperty("multiserver.distributedLock", "true"),
+                // [차단기] 이 PC는 Docker 경유 Redis 왕복이 부하 시 수십 ms까지 늘어, 운영값(30ms)이면 정상 Redis에도 차단기가 열린다.
+                "--app.bid.lock.breaker.slow-call=200ms",
                 "--spring.application.name=multiserver-" + name,
                 "--app.upload.dir=build/test-uploads/multiserver-" + name,
         };

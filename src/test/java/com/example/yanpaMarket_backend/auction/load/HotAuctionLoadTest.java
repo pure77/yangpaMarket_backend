@@ -209,6 +209,10 @@ class HotAuctionLoadTest {
     static void configurePrecheck(DynamicPropertyRegistry registry) {
         registry.add("app.bid.precheck.enabled", () -> String.valueOf(precheckOn()));
         registry.add("spring.data.redis.database", () -> String.valueOf(LOAD_REDIS_DATABASE));
+        // [분산 락 끔 — 안전망] 이 테스트는 자체 @Primary TimingBidLock으로 서버 1대를 측정하므로 메모리 락만 쓴다.
+        //   test 클래스패스의 application.properties가 main 것을 가려 지금은 스위치가 없어 꺼져 있지만,
+        //   혹시 기본값(true)이 들어와도 DistributedBidLock(@Primary)과 충돌하지 않도록 명시적으로 끈다.
+        registry.add("app.bid.lock.distributed.enabled", () -> "false");
     }
 
     /** "jdbc:mysql://host:port/db?params" → "jdbc:mysql://host:port/db_loadtest?params+자동생성" */
@@ -237,6 +241,15 @@ class HotAuctionLoadTest {
     private final int auctionCount = Integer.getInteger("load.auctions", 1);
     private final int durationSeconds = Integer.getInteger("load.seconds", 60);
     private final int thinkMillis = Integer.getInteger("load.thinkMillis", 100);
+    /**
+     * [가격을 읽는 시점] -Dload.priceReadAt=send|decide (기본 send = 예전 동작)
+     *   send   : 생각 시간이 끝나고 "보내기 직전에" 최신 가격을 읽는다. 도착 시 이미 낮은 입찰이 거의 없다.
+     *   decide : 생각을 "시작할 때" 가격을 읽고 금액을 정한 뒤, 생각 시간이 지나서 그 금액으로 보낸다.
+     *            실제 사용자는 화면을 보고 금액을 정한 뒤 몇 초 뒤에 버튼을 누른다. 화면은 실시간으로 바뀌어도
+     *            입력해 둔 금액은 결정한 순간의 가격 기준이라, 그사이 가격이 오르면 도착할 때 이미 낮다.
+     *            → Redis 사전 거절이 락 앞에서 걸러낼 수 있는 입찰이 자연스럽게 생긴다(임의 비율 없이).
+     */
+    private final boolean readPriceAtDecide = "decide".equals(System.getProperty("load.priceReadAt", "send"));
 
     @LocalServerPort int port;
     @Autowired UserRepository userRepository;
@@ -245,6 +258,8 @@ class HotAuctionLoadTest {
     @Autowired JwtProvider jwtProvider;
     @Autowired DataSource dataSource;
     @Autowired LoadMetrics metrics;
+    @Autowired InMemoryBidLock inMemoryBidLock; // 메모리 락 대기 초과(409) 횟수를 구간 차이로 읽는다
+    private long memoryLockWaitTimeouts; // 마지막 구간의 메모리 락 대기 초과 수 (buildReport가 읽는다)
     // 구간별 캐시 적중률([캐시] 섹션)을 읽기 위한 캐시 관리자
     @Autowired CacheManager cacheManager;
     // Tomcat 요청 스레드풀을 꺼내기 위한 컨텍스트(WebServerApplicationContext로 내장 서버를 얻는다)
@@ -602,8 +617,10 @@ class HotAuctionLoadTest {
                 ThreadPoolExecutor tomcatPool = unwrapTomcatExecutor();
                 Thread poolSampler = startPoolSampler(hikari, tomcatPool);
                 GuardStats guardBefore = guardStats();
+                long memLockTimeoutsBefore = inMemoryBidLock.waitTimeouts();
                 long wallNanos = runBiddingPhase(activeIds, tokensByAuction, phaseBidders);
                 GuardStats guardAfter = guardStats();
+                memoryLockWaitTimeouts = inMemoryBidLock.waitTimeouts() - memLockTimeoutsBefore;
                 GuardStats guardDelta = guardAfter == null ? null : guardAfter.minus(guardBefore);
                 CacheDeltas cacheDeltas = new CacheDeltas(
                         cacheDelta(auctionCacheBefore, CacheNames.AUCTION_ID_BY_PUBLIC_ID),
@@ -694,8 +711,18 @@ class HotAuctionLoadTest {
                 pool.submit(() -> {
                     try {
                         while (System.nanoTime() < deadline) {
-                            placeOneBid(auctionPublicId, token);
-                            Thread.sleep(ThreadLocalRandom.current().nextInt(thinkMillis / 2, thinkMillis * 2));
+                            if (readPriceAtDecide) {
+                                // 결정 시점에 금액의 기준 가격을 읽고 → 생각 시간 → 그 가격 기준으로 전송
+                                long decidedBase = metrics.latestPrice.get(auctionPublicId).get();
+                                Thread.sleep(ThreadLocalRandom.current().nextInt(thinkMillis / 2, thinkMillis * 2));
+                                if (System.nanoTime() >= deadline) {
+                                    break;
+                                }
+                                placeOneBid(auctionPublicId, token, decidedBase);
+                            } else {
+                                placeOneBid(auctionPublicId, token, metrics.latestPrice.get(auctionPublicId).get());
+                                Thread.sleep(ThreadLocalRandom.current().nextInt(thinkMillis / 2, thinkMillis * 2));
+                            }
                         }
                     } catch (InterruptedException e) {
                         Thread.currentThread().interrupt();
@@ -766,10 +793,12 @@ class HotAuctionLoadTest {
         return sb.toString();
     }
 
-    /** 입찰 1건: 그 경매의 화면에 보이는 현재가 위로 금액을 정하고 실제 HTTP POST를 보낸다. */
-    private void placeOneBid(String auctionPublicId, String token) {
+    /**
+     * 입찰 1건: 기준 가격(base) 위로 금액을 정하고 실제 HTTP POST를 보낸다.
+     * base는 호출자가 정한다 — 보내기 직전의 현재가(send) 또는 금액을 결정한 순간의 현재가(decide).
+     */
+    private void placeOneBid(String auctionPublicId, String token, long base) {
         AtomicLong latest = metrics.latestPrice.get(auctionPublicId);
-        long base = latest.get();
         long amount = base + INCREMENT * (1 + ThreadLocalRandom.current().nextInt(3));
         long start = System.nanoTime();
         metrics.sentAtByPrice.putIfAbsent(priceKey(auctionPublicId, amount), start);
@@ -1051,6 +1080,8 @@ class HotAuctionLoadTest {
         StringBuilder sb = new StringBuilder();
         sb.append(String.format("%n━━ 인기 경매 부하 ━━ 경매 %d건 / 입찰자 %d(경매당) / 구독자 %d(경매당) / %d초 ━━%n",
                 phaseAuctions, phaseBidders, subscriberCount, durationSeconds));
+        sb.append(String.format("생각 시간 %d~%dms / 가격 읽는 시점 %s%n", thinkMillis / 2, thinkMillis * 2,
+                readPriceAtDecide ? "decide(금액 결정 순간)" : "send(보내기 직전)"));
         sb.append(String.format("입찰 스레드 총 %d개 / STOMP 세션 총 %d개%n",
                 phaseAuctions * phaseBidders, totalSessions));
         sb.append(String.format("DB: %s%n", databaseProduct()));
@@ -1072,6 +1103,8 @@ class HotAuctionLoadTest {
         sb.append(segment("  (p) 사전 거절", preP50, preP95, srvP95));
         sb.append(segment("  (a) 진입·조회", entryP50, entryP95, srvP95));
         sb.append(segment("  (b) 락 대기", waitP50, waitP95, srvP95));
+        sb.append(String.format("      락 대기 꼬리  p99 %.1fms  최대 %.1fms  (대기 상한 app.bid.lock.local-wait 대비)%n",
+                metrics.lockWait.percentileMillis(0.99), metrics.lockWait.maxMillis()));
         sb.append(segment("  (c) 트랜잭션", txP50, txP95, srvP95));
         sb.append(segment("  (d) broadcast", castP50, castP95, srvP95));
         String outsideNote = "";
@@ -1121,6 +1154,8 @@ class HotAuctionLoadTest {
                 rejected, rejectRate * 100));
         sb.append(String.format("  409 ALREADY_BIDDING%,6d   %s%n", metrics.conflict409.get(),
                 metrics.conflict409.get() == 0 ? "OK 락 정상" : "<- 락이 뚫렸다는 신호"));
+        sb.append(String.format("    그중 메모리 락 대기 초과(409) %,d   (대기 상한 초과로 거절된 수 — 락이 뚫린 것이 아님)%n",
+                memoryLockWaitTimeouts));
         sb.append(String.format("  500                %,6d   %s%n", metrics.serverError500.get(),
                 metrics.serverError500.get() == 0 ? "OK" : "<- 버그"));
         if (metrics.otherStatus.get() > 0 || metrics.ioError.get() > 0) {

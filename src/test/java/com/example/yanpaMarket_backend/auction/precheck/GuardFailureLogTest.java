@@ -68,6 +68,16 @@ class GuardFailureLogTest {
     }
 
     @Test
+    void 대상_이름을_받는_생성자도_같은_폭주_방지_규칙을_따른다() {
+        GuardFailureLog lockLog = new GuardFailureLog("Redis 분산 락", "서버 메모리 락만으로 처리합니다");
+        RuntimeException error = new RuntimeException("down");
+
+        assertThat(lockLog.failure("lock", error)).isTrue();   // 첫 실패는 즉시 WARN
+        assertThat(lockLog.failure("lock", error)).isFalse();  // interval 안에서는 생략
+        assertThat(lockLog.recovered()).isTrue();              // WARN이 있었던 장애는 복구 INFO
+    }
+
+    @Test
     void 실패한_적이_없으면_복구_로그도_없다() {
         assertThat(log.recovered()).isFalse();
     }

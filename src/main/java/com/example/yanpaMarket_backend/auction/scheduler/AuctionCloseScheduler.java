@@ -41,7 +41,8 @@ import org.springframework.stereotype.Component;
  * [알려진 한계 — 미수정]
  *   1) 서버 2대면 중복 실행: 각 서버가 스케줄러를 돌린다. @Version이 DB 이중 수정은 막지만
  *      broadcast는 두 번 나갈 수 있다. ShedLock 같은 분산 스케줄러 락 필요.
- *      → InMemoryBidLock, SimpleBroker와 같은 시점에 함께 해결해야 하는 항목.
+ *      → 입찰 락의 서버 간 문제는 2단계(DistributedBidLock)에서 해결됐다. 이 항목은 3단계에서
+ *        SimpleBroker 한계와 함께 해결한다.
  *   2) 종료 1건당 쿼리 3번(경매/입찰/낙찰자 조회). 건별 트랜잭션이라 배치 선조회로 줄이기 어렵다
  *      — 선조회한 낙찰 정보는 그 사이 새 입찰이 들어오면 낡은 값이 되기 때문이다.
  *      다만 여기서 N은 "10초 안에 만료된 경매 수"라 보통 0~수 건이고 전부 PK 조회다.
