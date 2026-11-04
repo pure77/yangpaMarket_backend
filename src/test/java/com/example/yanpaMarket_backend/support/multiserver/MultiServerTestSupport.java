@@ -25,6 +25,8 @@ import org.testcontainers.utility.DockerImageName;
  *
  * [Redis 타임아웃 500ms] 이 PC는 부하 시 Docker 경유 Redis 왕복이 50ms를 넘을 수 있다(진단 결과).
  *   운영 기본값(50ms)이면 사전 거절이 타임아웃으로 건너뛰어져 엄격 검사가 이유 없이 실패할 수 있어서, 이 테스트에서만 늘린다.
+ *
+ * [분산 락] 두 서버는 같은 Redis의 auction:{id}:lock을 다툰다. Redisson 타임아웃은 spring.data.redis.timeout(500ms)을 따른다.
  */
 public final class MultiServerTestSupport {
 
@@ -85,6 +87,8 @@ public final class MultiServerTestSupport {
                 "--spring.data.redis.port=" + redisPort,
                 "--spring.data.redis.timeout=500ms",
                 "--app.bid.precheck.enabled=" + precheckEnabled,
+                // [분산 락] 기본 켬(2단계). -Dmultiserver.distributedLock=false면 도입 전 상태(서버마다 따로 락)를 재현한다.
+                "--app.bid.lock.distributed.enabled=" + System.getProperty("multiserver.distributedLock", "true"),
                 "--spring.application.name=multiserver-" + name,
                 "--app.upload.dir=build/test-uploads/multiserver-" + name,
         };

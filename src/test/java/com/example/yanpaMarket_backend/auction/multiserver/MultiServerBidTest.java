@@ -77,7 +77,7 @@ class MultiServerBidTest extends RedisTestSupport {
 
     enum Gate { OBSERVE, STRICT }
 
-    private static final Gate SCENARIO_1_GATE = Gate.OBSERVE; // 2단계(분산 락) 완료 시 STRICT
+    private static final Gate SCENARIO_1_GATE = Gate.STRICT;  // 2단계(분산 락) 완료 — 409 0건이어야 한다
     private static final Gate SCENARIO_2_GATE = Gate.OBSERVE; // 3단계(서버 간 전파) 완료 시 STRICT
     private static final Gate SCENARIO_3_GATE = Gate.OBSERVE; // 3단계(스케줄러 중복 방지) 완료 시 STRICT
     private static final Gate SCENARIO_4_GATE = Gate.STRICT;  // 지금도 통과해야 한다

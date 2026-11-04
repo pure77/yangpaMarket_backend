@@ -77,9 +77,10 @@ tasks.named('test') {
 	// load.precheck=on|off(기본 off): 입찰 사전 거절(Redis) A/B 비교. on이면 docker-compose Redis의 DB 15를 비우고 쓴다.
 	// load.priceReadAt=send|decide(기본 send): decide면 금액을 정한 순간의 가격으로, 생각 시간 뒤에 보낸다(현실적 부하).
 	// multiserver=true: 서버 2대 재현 테스트(MultiServerBidTest) 실행. Docker 필요.
+	// multiserver.distributedLock=false: 서버 2대 테스트를 분산 락 없이(도입 전 상태로) 실행 — 비교용
 	// multiserver.load=true: 서버 2대 부하 측정(MultiServerLoadTest) — 사전 거절 켬/끔별 DB 쿼리 수. 파라미터는 multiserver.load.*
 	['loadtest', 'load.profile', 'load.subscribers', 'load.bidders', 'load.seconds', 'load.thinkMillis',
-	 'load.poolSize', 'load.sweep', 'load.auctions', 'load.auctionSweep', 'load.precheck', 'load.priceReadAt', 'multiserver',
+	 'load.poolSize', 'load.sweep', 'load.auctions', 'load.auctionSweep', 'load.precheck', 'load.priceReadAt', 'multiserver', 'multiserver.distributedLock',
 	 'multiserver.load', 'multiserver.load.auctions', 'multiserver.load.bidders', 'multiserver.load.seconds',
 	 'multiserver.load.thinkMillis', 'multiserver.load.priceReadAt'].each { key ->
 		if (System.getProperty(key) != null) {
