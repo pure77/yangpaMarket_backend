@@ -209,6 +209,9 @@ class HotAuctionLoadTest {
     static void configurePrecheck(DynamicPropertyRegistry registry) {
         registry.add("app.bid.precheck.enabled", () -> String.valueOf(precheckOn()));
         registry.add("spring.data.redis.database", () -> String.valueOf(LOAD_REDIS_DATABASE));
+        // [분산 락 끔] mysql 프로필은 test 설정을 읽지 않아 기본값(true)이 들어온다. 켜지면 DistributedBidLock(@Primary)과
+        //   이 테스트의 TimingBidLock(@Primary)이 충돌한다. 이 테스트는 서버 1대 측정이라 메모리 락만 쓴다.
+        registry.add("app.bid.lock.distributed.enabled", () -> "false");
     }
 
     /** "jdbc:mysql://host:port/db?params" → "jdbc:mysql://host:port/db_loadtest?params+자동생성" */
