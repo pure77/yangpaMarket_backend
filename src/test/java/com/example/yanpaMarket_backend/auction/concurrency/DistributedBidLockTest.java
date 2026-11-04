@@ -136,4 +136,43 @@ class DistributedBidLockTest extends RedisTestSupport {
 
         assertThat(ttl).as("감시견이 아니라 명시한 lease").isBetween(1L, 3_000L);
     }
+
+    /** [장애 1] Redis가 죽어 있어도 입찰은 메모리 락만으로 빠르게 처리된다(fail-open). */
+    @Test
+    void Redis가_없으면_메모리_락만으로_빠르게_처리한다() throws Exception {
+        int deadPort;
+        try (java.net.ServerSocket s = new java.net.ServerSocket(0)) {
+            deadPort = s.getLocalPort();
+        }
+        RedissonClient dead = Redisson.create(RedissonConfig.config("localhost", deadPort, "", 0,
+                Duration.ofMillis(50), Duration.ofMillis(200)));
+        clients.add(dead);
+        DistributedBidLock lock = new DistributedBidLock(new InMemoryBidLock(), dead, WAIT, LEASE);
+
+        long start = System.nanoTime();
+        assertThat(lock.executeWithLock(11L, () -> "done")).isEqualTo("done");
+        Duration took = Duration.ofNanos(System.nanoTime() - start);
+
+        assertThat(took).as("죽은 Redis를 오래 기다리지 않는다").isLessThan(Duration.ofSeconds(1));
+        assertThat(lock.stats().fallbacks()).isEqualTo(1);
+        assertThat(lock.stats().acquired()).isZero();
+    }
+
+    /** [장애 2] lease가 작업보다 먼저 끝나 풀기가 실패해도 이미 끝난 작업의 결과는 정상 응답한다. */
+    @Test
+    void lease가_먼저_만료되면_풀기_실패를_삼키고_결과는_정상() {
+        DistributedBidLock lock = server(WAIT, Duration.ofMillis(100));
+
+        String result = lock.executeWithLock(12L, () -> {
+            try {
+                Thread.sleep(300); // lease(100ms)보다 길게 — 락이 먼저 풀린다
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            return "committed";
+        });
+
+        assertThat(result).isEqualTo("committed");
+        assertThat(lock.stats().releaseFailures()).isEqualTo(1);
+    }
 }
