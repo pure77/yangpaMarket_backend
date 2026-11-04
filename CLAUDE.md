@@ -81,6 +81,7 @@ API 명세는 `../docs/auction-project-spec.md`, 기능별 설계/계획은 `../
 - `./gradlew clean` (Windows: `./gradlew.bat clean`) - 빌드 산출물 정리
 - 테스트 로그인 포함 실행: `./gradlew.bat bootRun --args='--spring.profiles.active=secret,dev'` (`POST /api/v1/auth/dev/login` 활성화)
 - 부하 테스트: `./gradlew.bat test --tests '*HotAuctionLoadTest*' -Dloadtest=true` (파라미터는 `build.gradle`의 `load.*` 참고, `_loadtest` 접미사 DB에서만 실행)
+- 서버 2대 재현 테스트: `./gradlew.bat test --tests '*MultiServerBidTest*' -Dmultiserver=true` (Docker 필요. 결과는 `build/reports/multiserver/`. 2·3단계 완료 시 테스트의 상황별 Gate를 STRICT로)
 
 ## Important Notes
 - 민감 정보(DB 계정, 토큰 시크릿 등)는 Git에 커밋 금지
