@@ -3,6 +3,9 @@ package com.example.yanpaMarket_backend.auction.multiserver;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.fail;
 
+import com.example.yanpaMarket_backend.auction.concurrency.BidLock;
+import com.example.yanpaMarket_backend.auction.concurrency.DistributedBidLock;
+import com.example.yanpaMarket_backend.auction.concurrency.LockStats;
 import com.example.yanpaMarket_backend.auction.domain.Auction;
 import com.example.yanpaMarket_backend.auction.domain.AuctionCategory;
 import com.example.yanpaMarket_backend.auction.domain.AuctionItemCondition;
@@ -77,8 +80,10 @@ import org.testcontainers.mysql.MySQLContainer;
  *            -Dmultiserver.load.thinkMillis=3000  -Dmultiserver.load.priceReadAt=send,decide
  *   리포트: build/reports/multiserver/multi-server-load-{시각}.txt
  *
- * [한계] 서버 락은 아직 서버마다 따로다(2단계 미구현). 그래서 409가 날 수 있고, 그것도 기록한다.
- *   분산 락을 넣은 뒤 같은 테스트로 다시 재면 "분산 락에서 사전 거절이 아껴 주는 것"을 볼 수 있다.
+ * [분산 락] 기본값으로는 두 서버가 Redisson 분산 락을 공유한다(2단계 락).
+ *   -Dmultiserver.distributedLock=false 로 돌리면 분산 락 도입 전(서버마다 따로 락) 상태를 재현한다.
+ *   2026-11-03 기준선 수치는 분산 락 없이 잰 값이다. 리포트의 "분산 락" 줄이 락 카운터(잡음/대기 초과/메모리 락 대체/풀기 실패)다.
+ *   락이 없으면 409(ALREADY_BIDDING)가 날 수 있고, 그것도 기록한다.
  */
 @EnabledIfSystemProperty(named = "multiserver.load", matches = "true")
 class MultiServerLoadTest extends RedisTestSupport {
@@ -104,18 +109,27 @@ class MultiServerLoadTest extends RedisTestSupport {
     /** 구간 하나의 결과. 요약 표를 만들 때 켬/끔 짝을 찾는 데 쓴다. */
     private record PhaseResult(String readMode, int auctions, boolean precheck, int requests, int created,
                                int tooLow, int conflicts, Map<String, Long> queries, GuardStats guard,
-                               long p50Micros, long p95Micros) {
+                               long p50Micros, long p95Micros, LockStats lock) {
 
         double perRequest(String key) {
             return requests == 0 ? 0 : (double) queries.get(key) / requests;
         }
     }
 
+    /** 두 서버의 분산 락 카운터 합. 분산 락이 꺼져 있으면 0. */
+    private static LockStats lockStats(ServerHandle a, ServerHandle b) {
+        LockStats x = a.bean(BidLock.class) instanceof DistributedBidLock d ? d.stats() : new LockStats(0, 0, 0, 0);
+        LockStats y = b.bean(BidLock.class) instanceof DistributedBidLock d ? d.stats() : new LockStats(0, 0, 0, 0);
+        return new LockStats(x.acquired() + y.acquired(), x.waitTimeouts() + y.waitTimeouts(),
+                x.fallbacks() + y.fallbacks(), x.releaseFailures() + y.releaseFailures());
+    }
+
     @Test
     void 서버_2대에서_사전_거절_켬끔에_따른_DB_쿼리_수() throws Exception {
         line("━━ 서버 2대 부하 측정 ━━ " + LocalDateTime.now().withNano(0));
-        line(String.format("입찰자 %d명/경매 (A·B 절반씩), %d초, 생각 시간 %d~%dms, 경매 수 %s, 가격 읽는 시점 %s",
-                biddersPerAuction, seconds, thinkMillis / 2, thinkMillis * 2, auctionCounts, readModes));
+        line(String.format("입찰자 %d명/경매 (A·B 절반씩), %d초, 생각 시간 %d~%dms, 경매 수 %s, 가격 읽는 시점 %s, 분산 락 %s",
+                biddersPerAuction, seconds, thinkMillis / 2, thinkMillis * 2, auctionCounts, readModes,
+                System.getProperty("multiserver.distributedLock", "true")));
         List<PhaseResult> results = new ArrayList<>();
         try {
             int pair = 0;
@@ -201,6 +215,7 @@ class MultiServerLoadTest extends RedisTestSupport {
             }
 
             Map<String, Long> statusAfter = mysqlStatus(); // 정합성 확인 쿼리보다 먼저 — 측정에 섞이지 않게
+            LockStats lock = lockStats(a, b); // 구간마다 서버를 새로 띄우므로 시작값은 0
             GuardStats guard = bothServers(a, b).minus(guardBefore);
             Map<String, Long> queries = new HashMap<>();
             STATUS_KEYS.forEach(k -> queries.put(k, statusAfter.get(k) - statusBefore.get(k)));
@@ -226,7 +241,7 @@ class MultiServerLoadTest extends RedisTestSupport {
 
             List<Long> sorted = latencies.stream().sorted().toList();
             PhaseResult result = new PhaseResult(readMode, auctions, precheck, requests, created, tooLow, conflicts,
-                    queries, guard, percentile(sorted, 50), percentile(sorted, 95));
+                    queries, guard, percentile(sorted, 50), percentile(sorted, 95), lock);
             describe(result, counts);
             return result;
         } finally {
@@ -396,6 +411,8 @@ class MultiServerLoadTest extends RedisTestSupport {
                     g.precheckPass(), g.precheckTooLow(), g.precheckFailures(),
                     r.tooLow() == 0 ? 0 : 100.0 * g.precheckTooLow() / r.tooLow()));
         }
+        line(String.format("  분산 락        잡음 %,d  대기 초과(409) %,d  Redis 실패로 메모리 락 %,d  풀기 실패 %,d",
+                r.lock().acquired(), r.lock().waitTimeouts(), r.lock().fallbacks(), r.lock().releaseFailures()));
         line("  정합성 OK — DB 입찰 수 합계 == 201 응답 수" + (r.precheck() ? ", Redis == DB" : ""));
     }
 

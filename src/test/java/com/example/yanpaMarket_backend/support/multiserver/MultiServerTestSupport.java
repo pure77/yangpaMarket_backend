@@ -66,7 +66,8 @@ public final class MultiServerTestSupport {
 
     /**
      * @param precheckEnabled Redis 사전 거절 켬/끔. 서버 2대 부하 측정(MultiServerLoadTest)이 켬/끔을 비교할 때 쓴다.
-     *                        끄면 NoOpBidPriceGuard — 입찰 경로가 Redis 도입 전과 같다(Redis를 전혀 쓰지 않음).
+     *                        끄면 NoOpBidPriceGuard — 사전 거절에는 Redis를 쓰지 않는다.
+     *                        분산 락은 별도 스위치(-Dmultiserver.distributedLock)라, 켜져 있으면 사전 거절이 꺼져도 락에는 Redis를 쓴다.
      */
     public static ServerHandle startServer(String name, String ddlAuto, String redisHost, int redisPort,
                                            boolean precheckEnabled) {
