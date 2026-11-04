@@ -5,6 +5,7 @@ import static org.assertj.core.api.Assertions.fail;
 
 import com.example.yanpaMarket_backend.auction.concurrency.BidLock;
 import com.example.yanpaMarket_backend.auction.concurrency.DistributedBidLock;
+import com.example.yanpaMarket_backend.auction.concurrency.InMemoryBidLock;
 import com.example.yanpaMarket_backend.auction.concurrency.LockStats;
 import com.example.yanpaMarket_backend.auction.domain.Auction;
 import com.example.yanpaMarket_backend.auction.domain.AuctionCategory;
@@ -109,7 +110,7 @@ class MultiServerLoadTest extends RedisTestSupport {
     /** 구간 하나의 결과. 요약 표를 만들 때 켬/끔 짝을 찾는 데 쓴다. */
     private record PhaseResult(String readMode, int auctions, boolean precheck, int requests, int created,
                                int tooLow, int conflicts, Map<String, Long> queries, GuardStats guard,
-                               long p50Micros, long p95Micros, LockStats lock) {
+                               long p50Micros, long p95Micros, LockStats lock, long memoryLockTimeouts) {
 
         double perRequest(String key) {
             return requests == 0 ? 0 : (double) queries.get(key) / requests;
@@ -216,6 +217,8 @@ class MultiServerLoadTest extends RedisTestSupport {
 
             Map<String, Long> statusAfter = mysqlStatus(); // 정합성 확인 쿼리보다 먼저 — 측정에 섞이지 않게
             LockStats lock = lockStats(a, b); // 구간마다 서버를 새로 띄우므로 시작값은 0
+            // 메모리 락(InMemoryBidLock)의 대기 상한 초과 수 — 두 서버 합. 서버를 새로 띄우므로 끝값 = 구간값.
+            long memoryLockTimeouts = a.bean(InMemoryBidLock.class).waitTimeouts() + b.bean(InMemoryBidLock.class).waitTimeouts();
             GuardStats guard = bothServers(a, b).minus(guardBefore);
             Map<String, Long> queries = new HashMap<>();
             STATUS_KEYS.forEach(k -> queries.put(k, statusAfter.get(k) - statusBefore.get(k)));
@@ -241,7 +244,7 @@ class MultiServerLoadTest extends RedisTestSupport {
 
             List<Long> sorted = latencies.stream().sorted().toList();
             PhaseResult result = new PhaseResult(readMode, auctions, precheck, requests, created, tooLow, conflicts,
-                    queries, guard, percentile(sorted, 50), percentile(sorted, 95), lock);
+                    queries, guard, percentile(sorted, 50), percentile(sorted, 95), lock, memoryLockTimeouts);
             describe(result, counts);
             return result;
         } finally {
@@ -413,6 +416,7 @@ class MultiServerLoadTest extends RedisTestSupport {
         }
         line(String.format("  분산 락        잡음 %,d  대기 초과(409) %,d  Redis 실패로 메모리 락 %,d  차단기로 건너뜀 %,d  풀기 실패 %,d",
                 r.lock().acquired(), r.lock().waitTimeouts(), r.lock().fallbacks(), r.lock().breakerSkips(), r.lock().releaseFailures()));
+        line(String.format("  메모리 락      대기 초과(409) %,d", r.memoryLockTimeouts()));
         line("  정합성 OK — DB 입찰 수 합계 == 201 응답 수" + (r.precheck() ? ", Redis == DB" : ""));
     }
 

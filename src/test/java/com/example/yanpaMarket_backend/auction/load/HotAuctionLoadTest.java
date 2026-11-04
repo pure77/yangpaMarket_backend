@@ -258,6 +258,8 @@ class HotAuctionLoadTest {
     @Autowired JwtProvider jwtProvider;
     @Autowired DataSource dataSource;
     @Autowired LoadMetrics metrics;
+    @Autowired InMemoryBidLock inMemoryBidLock; // 메모리 락 대기 초과(409) 횟수를 구간 차이로 읽는다
+    private long memoryLockWaitTimeouts; // 마지막 구간의 메모리 락 대기 초과 수 (buildReport가 읽는다)
     // 구간별 캐시 적중률([캐시] 섹션)을 읽기 위한 캐시 관리자
     @Autowired CacheManager cacheManager;
     // Tomcat 요청 스레드풀을 꺼내기 위한 컨텍스트(WebServerApplicationContext로 내장 서버를 얻는다)
@@ -615,8 +617,10 @@ class HotAuctionLoadTest {
                 ThreadPoolExecutor tomcatPool = unwrapTomcatExecutor();
                 Thread poolSampler = startPoolSampler(hikari, tomcatPool);
                 GuardStats guardBefore = guardStats();
+                long memLockTimeoutsBefore = inMemoryBidLock.waitTimeouts();
                 long wallNanos = runBiddingPhase(activeIds, tokensByAuction, phaseBidders);
                 GuardStats guardAfter = guardStats();
+                memoryLockWaitTimeouts = inMemoryBidLock.waitTimeouts() - memLockTimeoutsBefore;
                 GuardStats guardDelta = guardAfter == null ? null : guardAfter.minus(guardBefore);
                 CacheDeltas cacheDeltas = new CacheDeltas(
                         cacheDelta(auctionCacheBefore, CacheNames.AUCTION_ID_BY_PUBLIC_ID),
@@ -1099,6 +1103,8 @@ class HotAuctionLoadTest {
         sb.append(segment("  (p) 사전 거절", preP50, preP95, srvP95));
         sb.append(segment("  (a) 진입·조회", entryP50, entryP95, srvP95));
         sb.append(segment("  (b) 락 대기", waitP50, waitP95, srvP95));
+        sb.append(String.format("      락 대기 꼬리  p99 %.1fms  최대 %.1fms  (대기 상한 app.bid.lock.local-wait 대비)%n",
+                metrics.lockWait.percentileMillis(0.99), metrics.lockWait.maxMillis()));
         sb.append(segment("  (c) 트랜잭션", txP50, txP95, srvP95));
         sb.append(segment("  (d) broadcast", castP50, castP95, srvP95));
         String outsideNote = "";
@@ -1148,6 +1154,8 @@ class HotAuctionLoadTest {
                 rejected, rejectRate * 100));
         sb.append(String.format("  409 ALREADY_BIDDING%,6d   %s%n", metrics.conflict409.get(),
                 metrics.conflict409.get() == 0 ? "OK 락 정상" : "<- 락이 뚫렸다는 신호"));
+        sb.append(String.format("    그중 메모리 락 대기 초과(409) %,d   (대기 상한 초과로 거절된 수 — 락이 뚫린 것이 아님)%n",
+                memoryLockWaitTimeouts));
         sb.append(String.format("  500                %,6d   %s%n", metrics.serverError500.get(),
                 metrics.serverError500.get() == 0 ? "OK" : "<- 버그"));
         if (metrics.otherStatus.get() > 0 || metrics.ioError.get() > 0) {
