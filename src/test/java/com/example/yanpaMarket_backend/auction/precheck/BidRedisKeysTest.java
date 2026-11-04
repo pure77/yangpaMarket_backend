@@ -11,4 +11,9 @@ class BidRedisKeysTest {
         // [왜 고정하나] {42}가 Cluster 해시 슬롯을 정한다. 2단계 락 키 auction:{42}:lock과 같은 슬롯이어야 한다.
         assertThat(BidRedisKeys.bid(42L)).isEqualTo("auction:{42}:bid");
     }
+
+    @Test
+    void 락_키는_입찰_키와_같은_해시_태그를_쓴다() {
+        assertThat(BidRedisKeys.lock(42L)).isEqualTo("auction:{42}:lock");
+    }
 }

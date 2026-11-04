@@ -13,6 +13,8 @@ import lombok.extern.slf4j.Slf4j;
  *   R2) 복구 INFO는 그 장애 구간에서 WARN이 한 번이라도 남았을 때만 남긴다(INFO 줄 수 ≤ WARN 줄 수).
  *       상태(실패 중 → 정상)는 로그 여부와 무관하게 매번 되돌린다.
  *
+ *   다른 Redis 사용처(분산 락)도 같은 규칙으로 쓴다(subject/fallback으로 자기 이름을 붙인다).
+ *
  * [왜] Redis가 죽은 동안 초당 100건이 들어오면, 실패마다 WARN을 남길 경우 초당 100줄이 쌓여
  *   정작 다른 로그를 묻고 디스크 I/O까지 늘린다. 요약의 "N건"은 근사치이며,
  *   정확한 실패 건수는 카운터(GuardStats)가 센다.
@@ -23,8 +25,10 @@ import lombok.extern.slf4j.Slf4j;
  * [nanoClock 주입] 테스트에서 10초를 기다리지 않고 시각을 넘기기 위해서다.
  */
 @Slf4j
-final class GuardFailureLog {
+public final class GuardFailureLog {
 
+    private final String subject;   // 로그 머리말(예: "Redis bid guard", "Redis 분산 락")
+    private final String fallback;  // 실패 시 대신 하는 동작 설명
     private final long intervalNanos;
     private final long intervalSeconds;
     private final LongSupplier nanoClock;
@@ -41,13 +45,24 @@ final class GuardFailureLog {
     }
 
     GuardFailureLog(Duration interval, LongSupplier nanoClock) {
+        this(interval, nanoClock, "Redis bid guard", "사전 거절 없이 기존 락 경로로 처리합니다");
+    }
+
+    /** [다른 Redis 사용처용] 분산 락 등이 같은 폭주 방지 규칙으로 자기 이름을 붙여 로그를 남긴다. */
+    public GuardFailureLog(String subject, String fallback) {
+        this(Duration.ofSeconds(10), System::nanoTime, subject, fallback);
+    }
+
+    private GuardFailureLog(Duration interval, LongSupplier nanoClock, String subject, String fallback) {
         this.intervalNanos = interval.toNanos();
         this.intervalSeconds = interval.toSeconds();
         this.nanoClock = nanoClock;
+        this.subject = subject;
+        this.fallback = fallback;
     }
 
     /** @return 이번 호출에서 로그를 남겼으면 true */
-    synchronized boolean failure(String operation, RuntimeException e) {
+    public synchronized boolean failure(String operation, RuntimeException e) {
         long now = nanoClock.getAsLong();
         boolean due = !everWarned || now - lastWarnAt >= intervalNanos;
 
@@ -56,7 +71,7 @@ final class GuardFailureLog {
             failing = true;
             warnedInOutage = false;
             if (due) {
-                log.warn("Redis bid guard 실패 — 사전 거절 없이 기존 락 경로로 처리합니다 (op={})", operation, e);
+                log.warn("{} 실패 — {} (op={})", subject, fallback, operation, e);
                 markWarned(now);
                 return true;
             }
@@ -66,8 +81,8 @@ final class GuardFailureLog {
 
         // 장애가 이어지는 중: interval마다 요약 한 번.
         if (due) {
-            log.warn("Redis bid guard 실패 약 {}건 (최근 {}s, 마지막 op={}: {})",
-                    suppressed + 1, intervalSeconds, operation, e.toString());
+            log.warn("{} 실패 약 {}건 (최근 {}s, 마지막 op={}: {})",
+                    subject, suppressed + 1, intervalSeconds, operation, e.toString());
             markWarned(now);
             return true;
         }
@@ -76,7 +91,7 @@ final class GuardFailureLog {
     }
 
     /** @return 실패 상태에서 막 벗어나 INFO를 남겼으면 true. 정상 경로에서 매번 불려도 비용은 volatile 읽기 한 번이다. */
-    boolean recovered() {
+    public boolean recovered() {
         if (!failing) {
             return false;
         }
@@ -88,7 +103,7 @@ final class GuardFailureLog {
             boolean shouldLog = warnedInOutage; // WARN 없이 끝난 장애는 복구 INFO도 없다
             warnedInOutage = false;
             if (shouldLog) {
-                log.info("Redis bid guard 복구 — 사전 거절을 다시 사용합니다");
+                log.info("{} 복구", subject);
             }
             return shouldLog;
         }
