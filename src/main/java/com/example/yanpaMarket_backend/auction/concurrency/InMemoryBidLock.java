@@ -1,7 +1,14 @@
 package com.example.yanpaMarket_backend.auction.concurrency;
 
+import com.example.yanpaMarket_backend.global.error.ApiException;
+import com.example.yanpaMarket_backend.global.error.ErrorCode;
+import java.time.Duration;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Supplier;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
 /**
@@ -13,7 +20,7 @@ import org.springframework.stereotype.Component;
  * [왜 synchronized가 아닌가]
  *   메서드에 synchronized를 걸면 모든 경매가 자물쇠 하나를 공유한다.
  *   전자제품 경매와 패션 경매가 서로 줄을 서게 되어 "동시 접속 100명" 목표에서 치명적이다.
- *   ReentrantLock은 추후 tryLock(timeout)/인터럽트 처리로 발전시킬 여지도 남는다.
+ *   ReentrantLock이라 tryLock(timeout)/인터럽트 처리가 가능하고, 아래 [대기 상한]에서 실제로 쓴다.
  *
  * [왜 ConcurrentHashMap<Long, Lock>(경매별 락)이 아닌가]
  *   거짓 경합이 전혀 없어 이상적이지만 락 객체가 무한히 늘어난다(경매 10만 개 = 락 10만 개).
@@ -21,6 +28,12 @@ import org.springframework.stereotype.Component;
  *   제대로 하려면 참조 카운팅이 필요하고, 그 카운팅이 또 동시성 문제를 낳는다.
  *   스트라이핑은 "메모리 상한을 고정하는 대신 약간의 거짓 경합을 받아들이는" 거래다.
  *   (Guava Striped, 옛 ConcurrentHashMap의 segment와 같은 아이디어)
+ *
+ * [대기 상한] 락을 무한정 기다리지 않고 최대 local-wait(기본 2초)까지만 기다린다. 넘으면 409(ALREADY_BIDDING).
+ *   원인이 뭐든(앞사람의 Redis 지연, 느린 DB 커밋 등) 한 스트라이프에 요청 스레드가 끝없이 쌓여
+ *   서버 전체가 느려지는 것을 막는다. 2초 근거: 측정 락 대기 p95 최대 357ms + 앞사람 Redis 대기 500ms ≈ 0.9s의
+ *   2배 이상이고 지연 목표(1s)의 2배다. 분산 락을 꺼도(서버 1대) 똑같이 적용된다.
+ *   초과 횟수는 waitTimeouts()로 읽어 측정 리포트에 쓴다.
  *
  * [싱글톤이 전제] 스프링 빈은 기본 싱글톤이라 앱 전체가 아래 locks 배열 하나를 공유한다.
  *   이게 락이 동작하는 전제다. @Scope("prototype")이면 요청마다 새 배열이 생겨
@@ -33,8 +46,19 @@ public class InMemoryBidLock implements BidLock {
     // 충돌해도 정확성에는 문제가 없다. 무관한 두 경매가 잠깐 순서를 기다릴 뿐.
     private static final int STRIPES = 256;
     private final ReentrantLock[] locks = new ReentrantLock[STRIPES];
+    private final long maxWaitMillis;
+    // 대기 상한을 넘겨 409로 끊은 누적 횟수. 락 밖에서도 읽으므로 원자 카운터.
+    private final AtomicLong waitTimeouts = new AtomicLong();
 
+    /** 기본 대기 상한 2초 — 기존 테스트·직접 생성용. */
     public InMemoryBidLock() {
+        this(Duration.ofSeconds(2));
+    }
+
+    /** 스프링이 쓰는 생성자. 상한은 app.bid.lock.local-wait로 바꾼다(기본 2s). */
+    @Autowired
+    public InMemoryBidLock(@Value("${app.bid.lock.local-wait:2s}") Duration maxWait) {
+        this.maxWaitMillis = maxWait.toMillis();
         for (int i = 0; i < STRIPES; i++) {
             // new ReentrantLock() = 비공정(unfair). new ReentrantLock(true)로 하면
             // "먼저 온 스레드가 먼저"가 보장되지만 처리량이 크게 떨어진다.
@@ -60,7 +84,19 @@ public class InMemoryBidLock implements BidLock {
         //   Long.hashCode()는 (int)(value ^ (value >>> 32))라 값이 커지면 음수가 나온다.
         //   %로 짰다면 개발 중엔 멀쩡하다가 운영에서 특정 ID부터 터지는 버그가 됐을 것이다.
         ReentrantLock lock = locks[Math.floorMod(auctionId.hashCode(), STRIPES)];
-        lock.lock();
+        // lock()은 무한 대기라 상한이 없다. tryLock(timeout)으로 바꿔 못 잡으면 409로 끊는다.
+        // 이 시점엔 아직 락을 못 잡았으므로 try/finally 밖에서 던져도 unlock 대상이 없다(안전).
+        boolean acquired;
+        try {
+            acquired = lock.tryLock(maxWaitMillis, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt(); // 인터럽트 상태를 되살려 위쪽이 알 수 있게 한다
+            throw new ApiException(ErrorCode.ALREADY_BIDDING);
+        }
+        if (!acquired) {
+            waitTimeouts.incrementAndGet();
+            throw new ApiException(ErrorCode.ALREADY_BIDDING);
+        }
         try {
             return action.get();
         } finally {
@@ -70,5 +106,10 @@ public class InMemoryBidLock implements BidLock {
             //   영구 정지한다. 서버 재시작 외에는 답이 없다. 데드락 중 가장 흔한 형태.
             lock.unlock();
         }
+    }
+
+    /** 대기 상한 초과로 409를 낸 누적 횟수(측정 리포트용). */
+    public long waitTimeouts() {
+        return waitTimeouts.get();
     }
 }
