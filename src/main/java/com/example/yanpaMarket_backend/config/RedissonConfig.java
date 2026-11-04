@@ -73,6 +73,9 @@ public class RedissonConfig {
                 .slowCallDurationThreshold(slowCall)
                 .waitDurationInOpenState(openWait)
                 .permittedNumberOfCallsInHalfOpenState(3)
+                // 이중 안전장치: 허가증 보고가 어딘가 빠져도 반열림에 영원히 갇히지 않고 5초 뒤 열림으로 돌아가 스스로 회복한다.
+                // 시험 호출은 최대 대기 0.5초 + 작업 시간이라 5초면 정상 시험을 끊지 않는다.
+                .maxWaitDurationInHalfOpenState(Duration.ofSeconds(5))
                 .build();
     }
 
