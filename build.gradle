@@ -38,6 +38,9 @@ dependencies {
 	implementation 'com.github.ben-manes.caffeine:caffeine'
 	// [Redis] 입찰 사전 거절용 현재가 사본. 클라이언트는 Lettuce(스타터 기본). 설정은 RedisConfig / application.properties.
 	implementation 'org.springframework.boot:spring-boot-starter-data-redis'
+	// [Redisson] 2단계 분산 락(DistributedBidLock) 전용. 핵심 라이브러리만 쓴다 — 스타터는 lettuce-core를 빼고
+	//   Redis 연결을 바꿔, 사전 거절(Lettuce)의 끊김 즉시 실패·50ms 타임아웃 설정이 사라지기 때문이다. 설정은 RedissonConfig.
+	implementation 'org.redisson:redisson:4.8.0'
 	implementation 'org.flywaydb:flyway-core'
 	implementation 'com.github.f4b6a3:ulid-creator:5.2.3'
 	implementation 'io.jsonwebtoken:jjwt-api:0.12.6'
