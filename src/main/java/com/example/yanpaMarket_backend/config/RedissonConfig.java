@@ -2,6 +2,8 @@ package com.example.yanpaMarket_backend.config;
 
 import com.example.yanpaMarket_backend.auction.concurrency.DistributedBidLock;
 import com.example.yanpaMarket_backend.auction.concurrency.InMemoryBidLock;
+import io.github.resilience4j.circuitbreaker.CircuitBreaker;
+import io.github.resilience4j.circuitbreaker.CircuitBreakerConfig;
 import java.time.Duration;
 import org.redisson.Redisson;
 import org.redisson.api.RedissonClient;
@@ -49,8 +51,29 @@ public class RedissonConfig {
     @Primary
     public DistributedBidLock distributedBidLock(InMemoryBidLock local, RedissonClient redissonClient,
             @Value("${app.bid.lock.wait:500ms}") Duration wait,
-            @Value("${app.bid.lock.lease:3s}") Duration lease) {
-        return new DistributedBidLock(local, redissonClient, wait, lease);
+            @Value("${app.bid.lock.lease:3s}") Duration lease,
+            @Value("${app.bid.lock.breaker.slow-call:30ms}") Duration slowCall,
+            @Value("${app.bid.lock.breaker.open-wait:1s}") Duration openWait) {
+        CircuitBreaker breaker = CircuitBreaker.of("redisBidLock", breakerConfig(slowCall, openWait));
+        return new DistributedBidLock(local, redissonClient, wait, lease, breaker);
+    }
+
+    /**
+     * [무엇] Redis 락 호출용 차단기 설정. 최근 20건(COUNT_BASED) 중 10건 이상 모이면 실패율 또는 느림 비율이 50% 이상일 때 열린다.
+     *   slowCall: 이보다 오래 걸린 호출을 "느림"으로 센다(타임아웃 50ms보다 낮게, 평소 왕복 ~1ms보다 확실히 높게).
+     *   openWait: 열린 뒤 이 시간이 지나면 반열림(3건 시험). static인 이유: 테스트가 같은 설정을 쓰게 하려고.
+     */
+    public static CircuitBreakerConfig breakerConfig(Duration slowCall, Duration openWait) {
+        return CircuitBreakerConfig.custom()
+                .slidingWindowType(CircuitBreakerConfig.SlidingWindowType.COUNT_BASED)
+                .slidingWindowSize(20)
+                .minimumNumberOfCalls(10)
+                .failureRateThreshold(50)
+                .slowCallRateThreshold(50)
+                .slowCallDurationThreshold(slowCall)
+                .waitDurationInOpenState(openWait)
+                .permittedNumberOfCallsInHalfOpenState(3)
+                .build();
     }
 
     public static Config config(String host, int port, String password, int database,

@@ -41,6 +41,8 @@ dependencies {
 	// [Redisson] 2단계 분산 락(DistributedBidLock) 전용. 핵심 라이브러리만 쓴다 — 스타터는 lettuce-core를 빼고
 	//   Redis 연결을 바꿔, 사전 거절(Lettuce)의 끊김 즉시 실패·50ms 타임아웃 설정이 사라지기 때문이다. 설정은 RedissonConfig.
 	implementation 'org.redisson:redisson:4.8.0'
+	// [Resilience4j] DistributedBidLock의 차단기(느리거나 실패하는 Redis를 잠시 건너뜀). 스타터가 아닌 순수 Java 모듈만 쓴다.
+	implementation 'io.github.resilience4j:resilience4j-circuitbreaker:2.4.0'
 	implementation 'org.flywaydb:flyway-core'
 	implementation 'com.github.f4b6a3:ulid-creator:5.2.3'
 	implementation 'io.jsonwebtoken:jjwt-api:0.12.6'

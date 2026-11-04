@@ -90,6 +90,8 @@ public final class MultiServerTestSupport {
                 "--app.bid.precheck.enabled=" + precheckEnabled,
                 // [분산 락] 기본 켬(2단계). -Dmultiserver.distributedLock=false면 도입 전 상태(서버마다 따로 락)를 재현한다.
                 "--app.bid.lock.distributed.enabled=" + System.getProperty("multiserver.distributedLock", "true"),
+                // [차단기] 이 PC는 Docker 경유 Redis 왕복이 부하 시 수십 ms까지 늘어, 운영값(30ms)이면 정상 Redis에도 차단기가 열린다.
+                "--app.bid.lock.breaker.slow-call=200ms",
                 "--spring.application.name=multiserver-" + name,
                 "--app.upload.dir=build/test-uploads/multiserver-" + name,
         };

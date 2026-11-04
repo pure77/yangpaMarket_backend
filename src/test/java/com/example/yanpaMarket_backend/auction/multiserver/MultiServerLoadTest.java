@@ -118,10 +118,10 @@ class MultiServerLoadTest extends RedisTestSupport {
 
     /** 두 서버의 분산 락 카운터 합. 분산 락이 꺼져 있으면 0. */
     private static LockStats lockStats(ServerHandle a, ServerHandle b) {
-        LockStats x = a.bean(BidLock.class) instanceof DistributedBidLock d ? d.stats() : new LockStats(0, 0, 0, 0);
-        LockStats y = b.bean(BidLock.class) instanceof DistributedBidLock d ? d.stats() : new LockStats(0, 0, 0, 0);
+        LockStats x = a.bean(BidLock.class) instanceof DistributedBidLock d ? d.stats() : new LockStats(0, 0, 0, 0, 0);
+        LockStats y = b.bean(BidLock.class) instanceof DistributedBidLock d ? d.stats() : new LockStats(0, 0, 0, 0, 0);
         return new LockStats(x.acquired() + y.acquired(), x.waitTimeouts() + y.waitTimeouts(),
-                x.fallbacks() + y.fallbacks(), x.releaseFailures() + y.releaseFailures());
+                x.fallbacks() + y.fallbacks(), x.breakerSkips() + y.breakerSkips(), x.releaseFailures() + y.releaseFailures());
     }
 
     @Test
@@ -411,8 +411,8 @@ class MultiServerLoadTest extends RedisTestSupport {
                     g.precheckPass(), g.precheckTooLow(), g.precheckFailures(),
                     r.tooLow() == 0 ? 0 : 100.0 * g.precheckTooLow() / r.tooLow()));
         }
-        line(String.format("  분산 락        잡음 %,d  대기 초과(409) %,d  Redis 실패로 메모리 락 %,d  풀기 실패 %,d",
-                r.lock().acquired(), r.lock().waitTimeouts(), r.lock().fallbacks(), r.lock().releaseFailures()));
+        line(String.format("  분산 락        잡음 %,d  대기 초과(409) %,d  Redis 실패로 메모리 락 %,d  차단기로 건너뜀 %,d  풀기 실패 %,d",
+                r.lock().acquired(), r.lock().waitTimeouts(), r.lock().fallbacks(), r.lock().breakerSkips(), r.lock().releaseFailures()));
         line("  정합성 OK — DB 입찰 수 합계 == 201 응답 수" + (r.precheck() ? ", Redis == DB" : ""));
     }
 
